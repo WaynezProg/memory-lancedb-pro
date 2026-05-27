@@ -71,7 +71,7 @@ That's the difference an **AI Memory Assistant** makes — it learns your style,
 
 ## Quick Start
 
-> **CPU Requirement:** Your CPU must support **AVX/AVX2** instructions (Intel Sandy Bridge 2011+ / AMD Bulldozer 2011+). LanceDB's native vector engine requires these — on unsupported CPUs the plugin will crash with `SIGILL` (Illegal Instruction). Check with: `grep -o 'avx[^ ]*' /proc/cpuinfo | head -1` (no output = not supported). See [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419) for details.
+> **CPU Requirement:** Your CPU must support **AVX** instructions. LanceDB native vector search may require **AVX2** on some Linux x64 builds and can crash AVX-only CPUs with `SIGILL`; set `retrieval.disableNativeCosine: true` or `MEMORY_LANCEDB_DISABLE_NATIVE_COSINE=1` to use a scoped row scan plus JavaScript cosine ranking. Check CPU flags with: `grep -o 'avx[^ ]*' /proc/cpuinfo | head -1` (no output = not supported). See [#419](https://github.com/CortexReach/memory-lancedb-pro/issues/419) and [#644](https://github.com/CortexReach/memory-lancedb-pro/issues/644) for details.
 
 ### Option A: One-Click Install Script (Recommended)
 
@@ -115,6 +115,13 @@ Add to your `openclaw.json`:
           "autoCapture": true,
           "autoRecall": true,
           "smartExtraction": true,
+          "canonicalCorpus": {
+            "enabled": true,
+            "syncOnSearch": true
+          },
+          "dreaming": {
+            "enabled": false
+          },
           "extractMinMessages": 2,
           "extractMaxChars": 8000,
           "sessionMemory": { "enabled": false }
@@ -133,23 +140,33 @@ Add to your `openclaw.json`:
 
 ---
 
-## ⚠️ Dual-Memory Architecture (Important)
+## ⚠️ Memory Architecture (Important)
 
-When `memory-lancedb-pro` is active, your system has **two independent memory layers** that do **not** auto-sync:
+When `memory-lancedb-pro` owns the OpenClaw memory slot, it now exposes one memory capability with two coordinated stores:
 
 | Memory Layer | Storage | What it's for | Recallable? |
 |---|---|---|---|
 | **Plugin Memory** | LanceDB (vector store) | Semantic recall via `memory_recall` / auto-recall | ✅ Yes |
-| **Markdown Memory** | `MEMORY.md`, `memory/YYYY-MM-DD.md` | Startup context, human-readable journal | ❌ Not auto-recalled |
+| **Canonical Corpus** | `MEMORY.md`, `memory/**/*.md`, recent session transcripts, `memory/dreaming/**/*.md` | Source-of-truth files and public artifacts | ✅ Via LanceDB semantic index when `canonicalCorpus.enabled` is true |
 
 **Key principle:**
-> A fact written into `memory/YYYY-MM-DD.md` is visible in startup context, but `memory_recall` **will not find it** unless it was also written via `memory_store` (or auto-captured by the plugin).
+> Canonical files remain the source of truth. LanceDB is the semantic index used to retrieve them with grounded paths, line spans, snippets, and citations.
 
 **What this means for you:**
 - Need semantic recall? → Use `memory_store` or let auto-capture do it
-- `memory/YYYY-MM-DD.md` → treat as a **daily journal / log**, not a recall source
-- `MEMORY.md` → curated human-readable reference, not a recall source
-- Plugin memory → **primary recall source** for `memory_recall` and auto-recall
+- `memory/YYYY-MM-DD.md` → treat as a **daily journal / log** that can also be indexed for semantic lookup
+- `MEMORY.md` → curated human-readable reference that can be indexed as canonical context
+- `memory/dreaming/**/*.md` → dream reports exposed as public artifacts and indexed as reflection context
+- Session JSONL transcripts → indexed as `source: "sessions"` when `canonicalCorpus.includeSessionTranscripts` is enabled
+- Plugin memory → primary write path for durable facts, preferences, decisions, and auto-captured memories
+
+OpenClaw hosts receive:
+
+- `api.registerMemoryCapability({ runtime, promptBuilder, flushPlanResolver, publicArtifacts })`
+- runtime search results shaped as `path`, `startLine`, `endLine`, `snippet`, `source`, and `citation`
+- public artifacts for `MEMORY.md`, `memory/**/*.md`, dream reports, and the dreaming event log at `memory/.dreams/events.jsonl`
+
+Dreaming compatibility is configured under the same plugin entry. If `dreaming.enabled` is true while this plugin owns `plugins.slots.memory`, OpenClaw can use the memory-core dreaming sidecar against this plugin's memory capability and public artifacts.
 
 Validate & restart:
 
@@ -442,7 +459,8 @@ Query → BM25 FTS ─────┘
     "dimensions": 1024,
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
-    "normalized": true
+    "normalized": true,
+    "clientTimeoutMs": 30000
   },
   "dbPath": "~/.openclaw/memory/lancedb-pro",
   "autoCapture": true,
@@ -461,6 +479,7 @@ Query → BM25 FTS ─────┘
     "recencyHalfLifeDays": 14,
     "recencyWeight": 0.1,
     "filterNoise": true,
+    "disableNativeCosine": false,
     "lengthNormAnchor": 500,
     "hardMinScore": 0.35,
     "timeDecayHalfLifeDays": 60,
@@ -566,6 +585,23 @@ Notes for `llm.auth: "oauth"`:
 - You can set `llm.oauthPath` if you want to store that file somewhere else.
 - `auth login` snapshots the previous api-key `llm` config next to the OAuth file, and `auth logout` restores that snapshot when available.
 - Switching from `api-key` to `oauth` does not automatically carry over `llm.baseURL`. Set it manually in OAuth mode only when you intentionally want a custom ChatGPT/Codex-compatible backend.
+
+</details>
+
+<details>
+<summary><strong>Legacy CPU Fallback</strong></summary>
+
+If an AVX-only Linux x64 host crashes inside LanceDB native vector search with `SIGILL`, disable native cosine and let memory-lancedb-pro scan scoped rows and rank them in JavaScript:
+
+```json
+{
+  "retrieval": {
+    "disableNativeCosine": true
+  }
+}
+```
+
+You can also set `MEMORY_LANCEDB_DISABLE_NATIVE_COSINE=1` for the same behavior.
 
 </details>
 

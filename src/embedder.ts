@@ -125,6 +125,8 @@ export interface EmbeddingConfig {
   omitDimensions?: boolean;
   /** Enable automatic chunking for documents exceeding context limits (default: true) */
   chunking?: boolean;
+  /** OpenAI SDK per-request timeout in ms. Defaults to 30000. */
+  clientTimeoutMs?: number;
 }
 
 type EmbeddingProviderProfile =
@@ -163,6 +165,7 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
   "gemini-embedding-001": 3072,
   "nomic-embed-text": 768,
   "mxbai-embed-large": 1024,
+  "bge-m3": 1024,
   "BAAI/bge-m3": 1024,
   "all-MiniLM-L6-v2": 384,
   "all-mpnet-base-v2": 512,
@@ -420,6 +423,12 @@ const MAX_EMBED_DEPTH = 3;
 /** Global timeout for a single embedding operation (ms). */
 const EMBED_TIMEOUT_MS = 10_000;
 
+/** Default SDK-level HTTP timeout for embedding requests, including batch calls. */
+const DEFAULT_EMBED_CLIENT_TIMEOUT_MS = 30_000;
+
+/** Bounded startup health probe timeout; normal embeddings keep the larger client timeout. */
+const EMBED_HEALTH_CHECK_TIMEOUT_MS = 7_500;
+
 /**
  * Strictly decreasing character limit for forced truncation.
  * Each recursion level MUST reduce input by this factor to guarantee progress.
@@ -492,6 +501,9 @@ export class Embedder {
     this._autoChunk = config.chunking !== false;
     const profile = detectEmbeddingProviderProfile(this._baseURL, this._model);
     this._capabilities = getEmbeddingCapabilities(profile);
+    const clientTimeoutMs = Number.isFinite(config.clientTimeoutMs) && config.clientTimeoutMs! > 0
+      ? Math.floor(config.clientTimeoutMs!)
+      : DEFAULT_EMBED_CLIENT_TIMEOUT_MS;
 
     // Warn if configured fields will be silently ignored by this provider profile
     if (config.normalized !== undefined && !this._capabilities.normalized) {
@@ -522,6 +534,8 @@ export class Embedder {
       return new OpenAI({
         apiKey: key,
         ...(baseURL ? { baseURL } : {}),
+        timeout: clientTimeoutMs,
+        maxRetries: 0,
         defaultHeaders: Object.keys(defaultHeaders).length > 0 ? defaultHeaders : undefined,
       });
     });
@@ -633,7 +647,7 @@ export class Embedder {
         );
       }
 
-      const data = await response.json();
+      const data = await response.json() as any;
 
       // Validate response count and non-empty embeddings
       if (
@@ -673,7 +687,7 @@ export class Embedder {
       );
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
 
     // Ollama /api/embeddings returns { embedding: number[] },
     // convert to OpenAI-compatible shape { data: [{ embedding: number[] }] }
@@ -1120,9 +1134,14 @@ export class Embedder {
   }
 
   // Test connection and validate configuration
-  async test(): Promise<{ success: boolean; error?: string; dimensions?: number }> {
+  async test(options: { timeoutMs?: number } = {}): Promise<{ success: boolean; error?: string; dimensions?: number }> {
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs! > 0
+      ? Math.floor(options.timeoutMs!)
+      : EMBED_HEALTH_CHECK_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const testEmbedding = await this.embedPassage("test");
+      const testEmbedding = await this.embedPassage("test", controller.signal);
       return {
         success: true,
         dimensions: testEmbedding.length,
@@ -1132,6 +1151,8 @@ export class Embedder {
         success: false,
         error: error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
