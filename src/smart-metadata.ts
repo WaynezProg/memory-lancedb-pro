@@ -26,7 +26,13 @@ export interface MemoryRelation {
   targetId: string;
 }
 
-export type MemoryState = "pending" | "confirmed" | "archived";
+export type MemoryState =
+  | "pending"
+  | "confirmed"
+  | "archived"
+  | "superseded"
+  | "obsolete_preference"
+  | "conflicting";
 export type MemoryLayer = "durable" | "working" | "reflection" | "archive";
 export type MemorySource =
   | "manual"
@@ -111,6 +117,9 @@ function normalizeState(value: unknown): MemoryState {
     case "pending":
     case "confirmed":
     case "archived":
+    case "superseded":
+    case "obsolete_preference":
+    case "conflicting":
       return value;
     default:
       return "confirmed";

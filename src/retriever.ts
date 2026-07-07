@@ -217,6 +217,10 @@ function clamp01WithFloor(value: number, floor: number): number {
   return Math.max(safeFloor, clamp01(value, safeFloor));
 }
 
+function hasHistoryIntent(query: string): boolean {
+  return /(以前|歷史|历史|舊方法|旧方法|過去|过去|previous|formerly|deprecated|history|historical|old method)/i.test(query);
+}
+
 type TaggedRetrievalError = Error & {
   retrievalFailureStage?: NonNullable<RetrievalDiagnostics["failureStage"]>;
 };
@@ -606,6 +610,7 @@ export class MemoryRetriever {
           category,
           trace,
           diagnostics,
+          source,
         );
       } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
         results = await this.vectorOnlyRetrieval(
@@ -615,6 +620,7 @@ export class MemoryRetriever {
           category,
           trace,
           diagnostics,
+          source,
         );
       } else {
         results = await this.hybridRetrieval(
@@ -674,15 +680,15 @@ export class MemoryRetriever {
 
     if (tagTokens.length > 0) {
       results = await this.bm25OnlyRetrieval(
-        query, tagTokens, safeLimit, scopeFilter, category, trace,
+        query, tagTokens, safeLimit, scopeFilter, category, trace, undefined, source,
       );
     } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
       results = await this.vectorOnlyRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, undefined, source,
       );
     } else {
       results = await this.hybridRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, source,
       );
     }
 
@@ -717,6 +723,7 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
+    source?: RetrievalContext["source"],
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
@@ -741,14 +748,19 @@ export class MemoryRetriever {
         const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
         return !isMemoryExpired(metadata);
       });
+      const governed = this.applySupersessionRetrievalPolicy(
+        unexpired,
+        query,
+        source,
+      );
       if (diagnostics) {
-        diagnostics.vectorResultCount = unexpired.length;
-        diagnostics.fusedResultCount = unexpired.length;
-        diagnostics.stageCounts.afterMinScore = unexpired.length;
-        diagnostics.stageCounts.rerankInput = unexpired.length;
+        diagnostics.vectorResultCount = governed.length;
+        diagnostics.fusedResultCount = governed.length;
+        diagnostics.stageCounts.afterMinScore = governed.length;
+        diagnostics.stageCounts.rerankInput = governed.length;
       }
 
-      const mapped = unexpired.map(
+      const mapped = governed.map(
         (result, index) =>
           ({
             ...result,
@@ -804,6 +816,7 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
+    source?: RetrievalContext["source"],
   ): Promise<RetrievalResult[]> {
     const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
 
@@ -826,7 +839,12 @@ export class MemoryRetriever {
       const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
       return !isMemoryExpired(metadata);
     });
-    const mapped = unexpiredResults.map(
+    const governedResults = this.applySupersessionRetrievalPolicy(
+      unexpiredResults,
+      query,
+      source,
+    );
+    const mapped = governedResults.map(
       (result, index) =>
         ({
           ...result,
@@ -1009,20 +1027,25 @@ export class MemoryRetriever {
         const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
         return !isMemoryExpired(metadata);
       });
-      if (diagnostics) diagnostics.stageCounts.afterMinScore = filtered.length;
+      const governed = this.applySupersessionRetrievalPolicy(
+        filtered,
+        query,
+        source,
+      );
+      if (diagnostics) diagnostics.stageCounts.afterMinScore = governed.length;
 
       const rerankInput =
-        this.config.rerank !== "none" ? filtered.slice(0, limit * 2) : filtered;
+        this.config.rerank !== "none" ? governed.slice(0, limit * 2) : governed;
       if (diagnostics) diagnostics.stageCounts.rerankInput = rerankInput.length;
 
       let reranked: RetrievalResult[];
       failureStage = "hybrid.rerank";
       if (this.config.rerank !== "none") {
-        trace?.startStage("rerank", filtered.map((r) => r.entry.id));
+        trace?.startStage("rerank", governed.map((r) => r.entry.id));
         reranked = await this.rerankResults(query, queryVector, rerankInput);
         trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
       } else {
-        reranked = filtered;
+        reranked = governed;
       }
       if (diagnostics) diagnostics.stageCounts.afterRerank = reranked.length;
 
@@ -1592,6 +1615,39 @@ export class MemoryRetriever {
         // best-effort: ignore
       }
     }
+  }
+
+  private applySupersessionRetrievalPolicy<T extends { entry: MemoryEntry; score: number }>(
+    results: T[],
+    query: string,
+    source?: RetrievalContext["source"],
+  ): T[] {
+    if (source !== "auto-recall") {
+      return results;
+    }
+
+    const historyIntent = hasHistoryIntent(query);
+    const governed: T[] = [];
+
+    for (const result of results) {
+      const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+
+      if (metadata.state === "obsolete_preference" && !historyIntent) {
+        continue;
+      }
+
+      if (metadata.state === "superseded" && !historyIntent) {
+        governed.push({
+          ...result,
+          score: clamp01(result.score * 0.2, 0),
+        });
+        continue;
+      }
+
+      governed.push(result);
+    }
+
+    return governed.sort((a, b) => b.score - a.score);
   }
 
   /**
