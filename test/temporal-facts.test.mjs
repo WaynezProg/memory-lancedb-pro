@@ -221,6 +221,18 @@ async function runTest() {
     assert.equal(results[0].entry.id, currentEntry.id);
     console.log("  ✅ retrieval prefers current truth by filtering invalidated memories");
 
+    const historyResults = await retriever.retrieve({
+      query: "饮品偏好",
+      limit: 5,
+      scopeFilter: ["test"],
+      source: "cli",
+      lifecycleMode: "history",
+    });
+    assert.ok(
+      historyResults.some((result) => result.entry.id === historicalEntry.id),
+      "history mode should include legacy confirmed+invalidated rows",
+    );
+
     console.log("\nTest 4: retrieval survives crowding by many superseded versions...");
     // Insert 8 inactive historical versions sharing the same vector space.
     // With limit=5, a naive top-N + post-filter would return [] because
@@ -274,6 +286,43 @@ async function runTest() {
       assert.equal(isMemoryActiveAt(meta), true, `entry ${r.entry.id} should be active`);
     }
     console.log("  ✅ active fact survives crowding by 8 inactive versions (limit=5)");
+
+    console.log("\nTest 5: state-only archived rows cannot crowd active retrieval...");
+    for (let i = 0; i < 8; i++) {
+      await store.store({
+        text: `饮品偏好：归档版本${i}`,
+        vector: activeVector,
+        category: "preference",
+        scope: "test",
+        importance: 0.9,
+        metadata: stringifySmartMetadata(
+          buildSmartMetadata(
+            { text: `饮品偏好：归档版本${i}`, category: "preference", importance: 0.9 },
+            {
+              state: "archived",
+              memory_layer: "archive",
+              l0_abstract: `饮品偏好：归档版本${i}`,
+              memory_category: "preferences",
+            },
+          ),
+        ),
+      });
+    }
+
+    const stateCrowdedResults = await retriever.retrieve({
+      query: "饮品偏好",
+      limit: 5,
+      scopeFilter: ["test"],
+      source: "cli",
+      lifecycleMode: "active",
+    });
+    assert.ok(stateCrowdedResults.length >= 1);
+    assert.equal(stateCrowdedResults[0].entry.id, currentEntry.id);
+    for (const result of stateCrowdedResults) {
+      const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+      assert.equal(meta.state, "confirmed");
+    }
+    console.log("  ✅ active fact survives state-only archive crowding");
 
     console.log("\n=== Temporal facts tests passed! ===");
   } finally {

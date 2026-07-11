@@ -17,8 +17,10 @@ import type { TierManager } from "./tier-manager.js";
 import {
   getDecayableFromEntry,
   isMemoryExpired,
+  isMemoryVisibleInMode,
   parseSmartMetadata,
   toLifecycleMemory,
+  type MemoryRecallMode,
 } from "./smart-metadata.js";
 import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
 import { RetrievalStatsCollector } from "./retrieval-stats.js";
@@ -105,8 +107,8 @@ export interface RetrievalContext {
   category?: string;
   /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
   source?: "manual" | "auto-recall" | "cli";
-  /** Include inactive/expired rows for explicitly labeled history or review tools. */
-  includeInactive?: boolean;
+  /** Lifecycle view applied while filling candidate slots. Defaults to active. */
+  lifecycleMode?: MemoryRecallMode;
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -585,7 +587,7 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source, includeInactive = false } = context;
+    const { query, limit, scopeFilter, category, source, lifecycleMode = "active" } = context;
     const safeLimit = clampInt(limit, 1, 20);
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
@@ -635,7 +637,7 @@ export class MemoryRetriever {
           category,
           trace,
           diagnostics,
-          includeInactive,
+          lifecycleMode,
         );
       } else if (this.config.mode === "vector" || !hasFtsSupport) {
         results = await this.vectorOnlyRetrieval(
@@ -645,7 +647,7 @@ export class MemoryRetriever {
           category,
           trace,
           diagnostics,
-          includeInactive,
+          lifecycleMode,
         );
       } else {
         results = await this.hybridRetrieval(
@@ -656,7 +658,7 @@ export class MemoryRetriever {
           trace,
           source,
           diagnostics,
-          includeInactive,
+          lifecycleMode,
         );
       }
 
@@ -697,7 +699,7 @@ export class MemoryRetriever {
   async retrieveWithTrace(
     context: RetrievalContext,
   ): Promise<{ results: RetrievalResult[]; trace: RetrievalTrace }> {
-    const { query, limit, scopeFilter, category, source } = context;
+    const { query, limit, scopeFilter, category, source, lifecycleMode = "active" } = context;
     const safeLimit = clampInt(limit, 1, 20);
     const trace = new TraceCollector();
 
@@ -709,15 +711,15 @@ export class MemoryRetriever {
 
     if (tagTokens.length > 0) {
       results = await this.bm25OnlyRetrieval(
-        query, tagTokens, safeLimit, scopeFilter, category, trace,
+        query, tagTokens, safeLimit, scopeFilter, category, trace, undefined, lifecycleMode,
       );
     } else if (this.config.mode === "vector" || !hasFtsSupport) {
       results = await this.vectorOnlyRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, undefined, lifecycleMode,
       );
     } else {
       results = await this.hybridRetrieval(
-        query, safeLimit, scopeFilter, category, trace,
+        query, safeLimit, scopeFilter, category, trace, source, undefined, lifecycleMode,
       );
     }
 
@@ -752,7 +754,7 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
-    includeInactive = false,
+    lifecycleMode: MemoryRecallMode = "active",
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
@@ -764,7 +766,7 @@ export class MemoryRetriever {
         candidatePoolSize,
         this.config.minScore,
         scopeFilter,
-        { excludeInactive: !includeInactive },
+        { lifecycleMode },
       );
 
       const filtered = category
@@ -773,11 +775,12 @@ export class MemoryRetriever {
 
       // Filter expired memories early — before scoring — so they don't
       // occupy candidate slots that should go to live memories.
-      const unexpired = filtered.filter((r) => {
-        if (includeInactive) return true;
-        const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
-        return !isMemoryExpired(metadata);
-      });
+      const unexpired = filtered.filter((r) =>
+        isMemoryVisibleInMode(
+          parseSmartMetadata(r.entry.metadata, r.entry),
+          lifecycleMode,
+        ),
+      );
       if (diagnostics) {
         diagnostics.vectorResultCount = unexpired.length;
         diagnostics.fusedResultCount = unexpired.length;
@@ -841,7 +844,7 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
-    includeInactive = false,
+    lifecycleMode: MemoryRecallMode = "active",
   ): Promise<RetrievalResult[]> {
     const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
 
@@ -850,7 +853,7 @@ export class MemoryRetriever {
       query,
       candidatePoolSize,
       scopeFilter,
-      { excludeInactive: !includeInactive },
+      { lifecycleMode },
     );
     const categoryFiltered = category
       ? bm25Results.filter((r) => r.entry.category === category)
@@ -860,11 +863,12 @@ export class MemoryRetriever {
       return tagTokens.every((t) => textLower.includes(t.toLowerCase()));
     });
     // Filter expired memories early — before scoring
-    const unexpiredResults = mustContainFiltered.filter((r) => {
-      if (includeInactive) return true;
-      const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
-      return !isMemoryExpired(metadata);
-    });
+    const unexpiredResults = mustContainFiltered.filter((r) =>
+      isMemoryVisibleInMode(
+        parseSmartMetadata(r.entry.metadata, r.entry),
+        lifecycleMode,
+      ),
+    );
     const mapped = unexpiredResults.map(
       (result, index) =>
         ({
@@ -946,7 +950,7 @@ export class MemoryRetriever {
     trace?: TraceCollector,
     source?: RetrievalContext["source"],
     diagnostics?: RetrievalDiagnostics,
-    includeInactive = false,
+    lifecycleMode: MemoryRecallMode = "active",
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
     try {
@@ -966,14 +970,14 @@ export class MemoryRetriever {
           candidatePoolSize,
           scopeFilter,
           category,
-          includeInactive,
+          lifecycleMode,
         ),
         this.runBM25Search(
           bm25Query,
           candidatePoolSize,
           scopeFilter,
           category,
-          includeInactive,
+          lifecycleMode,
         ),
       ]);
 
@@ -1047,11 +1051,12 @@ export class MemoryRetriever {
       trace?.endStage(scoreFiltered.map((r) => r.entry.id), scoreFiltered.map((r) => r.score));
 
       // Filter expired memories early — before rerank/scoring
-      const filtered = scoreFiltered.filter((r) => {
-        if (includeInactive) return true;
-        const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
-        return !isMemoryExpired(metadata);
-      });
+      const filtered = scoreFiltered.filter((r) =>
+        isMemoryVisibleInMode(
+          parseSmartMetadata(r.entry.metadata, r.entry),
+          lifecycleMode,
+        ),
+      );
       if (diagnostics) diagnostics.stageCounts.afterMinScore = filtered.length;
 
       const rerankInput =
@@ -1137,14 +1142,14 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
-    includeInactive = false,
+    lifecycleMode: MemoryRecallMode = "active",
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
     const results = await this.store.vectorSearch(
       queryVector,
       limit,
       0.1,
       scopeFilter,
-      { excludeInactive: !includeInactive },
+      { lifecycleMode },
     );
 
     // Filter by category if specified
@@ -1163,9 +1168,9 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
-    includeInactive = false,
+    lifecycleMode: MemoryRecallMode = "active",
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.bm25Search(query, limit, scopeFilter, { excludeInactive: !includeInactive });
+    const results = await this.store.bm25Search(query, limit, scopeFilter, { lifecycleMode });
 
     // Filter by category if specified
     const filtered = category

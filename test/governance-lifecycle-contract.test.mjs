@@ -70,6 +70,10 @@ describe("memory lifecycle contract", () => {
     assert.equal(isMemoryVisibleInMode(meta("conflicting"), "review", NOW), true);
     assert.equal(isMemoryVisibleInMode(meta("pending"), "review", NOW), true);
     assert.equal(
+      isMemoryVisibleInMode(meta("confirmed", { invalidated_at: NOW - 1 }), "history", NOW),
+      true,
+    );
+    assert.equal(
       isMemoryVisibleInMode(meta("confirmed", { valid_until: NOW - 1 }), "active", NOW),
       false,
     );

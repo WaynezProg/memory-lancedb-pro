@@ -25,7 +25,13 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import {
+  buildSmartMetadata,
+  isMemoryVisibleInMode,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+  type MemoryRecallMode,
+} from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -45,6 +51,11 @@ export interface MemoryEntry extends Record<string, unknown> {
 export interface MemorySearchResult {
   entry: MemoryEntry;
   score: number;
+}
+
+interface SearchLifecycleOptions {
+  excludeInactive?: boolean;
+  lifecycleMode?: MemoryRecallMode;
 }
 
 export interface StoreConfig {
@@ -1383,7 +1394,7 @@ export class MemoryStore {
     });
   }
 
-  async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
+  async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], options?: SearchLifecycleOptions): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
@@ -1391,8 +1402,8 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 20);
     // Over-fetch more aggressively when filtering inactive records,
     // because superseded historical rows can crowd out active ones.
-    const inactiveFilter = options?.excludeInactive ?? false;
-    const overFetchMultiplier = inactiveFilter ? 20 : 10;
+    const lifecycleMode = options?.lifecycleMode ?? (options?.excludeInactive ? "active" : undefined);
+    const overFetchMultiplier = lifecycleMode ? 20 : 10;
     const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
     if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
@@ -1457,8 +1468,10 @@ export class MemoryStore {
         metadata: (row.metadata as string) || "{}",
       };
 
-      // Skip inactive (superseded) records when requested
-      if (inactiveFilter && !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))) {
+      if (
+        lifecycleMode &&
+        !isMemoryVisibleInMode(parseSmartMetadata(entry.metadata, entry), lifecycleMode)
+      ) {
         continue;
       }
 
@@ -1478,16 +1491,16 @@ export class MemoryStore {
     query: string,
     limit = 5,
     scopeFilter?: string[],
-    options?: { excludeInactive?: boolean },
+    options?: SearchLifecycleOptions,
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const safeLimit = clampInt(limit, 1, 20);
-    const inactiveFilter = options?.excludeInactive ?? false;
+    const lifecycleMode = options?.lifecycleMode ?? (options?.excludeInactive ? "active" : undefined);
     // Over-fetch when filtering inactive records to avoid crowding
-    const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
+    const fetchLimit = lifecycleMode ? Math.min(safeLimit * 20, 200) : safeLimit;
 
     if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
       return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
@@ -1539,8 +1552,10 @@ export class MemoryStore {
             metadata: (row.metadata as string) || "{}",
         };
 
-        // Skip inactive (superseded) records when requested
-        if (inactiveFilter && !isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry))) {
+        if (
+          lifecycleMode &&
+          !isMemoryVisibleInMode(parseSmartMetadata(entry.metadata, entry), lifecycleMode)
+        ) {
           continue;
         }
 
@@ -1559,7 +1574,7 @@ export class MemoryStore {
     }
   }
 
-  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[], options?: { excludeInactive?: boolean }): Promise<MemorySearchResult[]> {
+  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[], options?: SearchLifecycleOptions): Promise<MemorySearchResult[]> {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const trimmedQuery = query.trim();
@@ -1605,8 +1620,8 @@ export class MemoryStore {
 
       const metadata = parseSmartMetadata(entry.metadata, entry);
 
-      // Skip inactive (superseded) records when requested
-      if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
+      const lifecycleMode = options?.lifecycleMode ?? (options?.excludeInactive ? "active" : undefined);
+      if (lifecycleMode && !isMemoryVisibleInMode(metadata, lifecycleMode)) {
         continue;
       }
 

@@ -183,7 +183,7 @@ async function retrieveWithRetry(
     scopeFilter?: string[];
     category?: string;
     source?: "manual" | "auto-recall" | "cli";
-    includeInactive?: boolean;
+    lifecycleMode?: MemoryRecallMode;
   },
   countStore?: () => Promise<number>,
 ): Promise<RetrievalResult[]> {
@@ -643,7 +643,7 @@ export function registerMemoryRecallTool(
             scopeFilter,
             category,
             source: "manual",
-            includeInactive: mode !== "active",
+            lifecycleMode: mode,
           }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
           const results = candidates
             .filter((result) =>

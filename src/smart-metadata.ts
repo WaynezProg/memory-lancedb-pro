@@ -314,8 +314,12 @@ export function isMemoryVisibleInMode(
     );
   }
   if (mode === "history") {
-    return ["superseded", "obsolete_preference", "archived"].includes(
-      metadata.state,
+    if (["superseded", "obsolete_preference", "archived"].includes(metadata.state)) {
+      return true;
+    }
+    return (
+      metadata.state === "confirmed" &&
+      (!isMemoryActiveAt(metadata, at) || isMemoryExpired(metadata, at))
     );
   }
   return metadata.state === "pending" || metadata.state === "conflicting";
