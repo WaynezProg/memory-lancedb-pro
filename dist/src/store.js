@@ -8,6 +8,7 @@ import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpa
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSmartMetadata, isMemoryVisibleInMode, parseSmartMetadata, stringifySmartMetadata, } from "./smart-metadata.js";
+const MAX_LIFECYCLE_SEARCH_CANDIDATES = 5000;
 // ============================================================================
 // LanceDB Dynamic Import
 // ============================================================================
@@ -1181,66 +1182,81 @@ export class MemoryStore {
         // because superseded historical rows can crowd out active ones.
         const lifecycleMode = options?.lifecycleMode ?? (options?.excludeInactive ? "active" : undefined);
         const overFetchMultiplier = lifecycleMode ? 20 : 10;
-        const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
+        let fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
         if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
             console.warn("memory-lancedb-pro: LanceDB native vector cosine disabled; scanning candidates and using JS cosine rerank fallback");
             this.nativeCosineFallbackLogged = true;
         }
-        let query = this.disableNativeCosine
-            ? this.table.query().select([
-                "id",
-                "text",
-                "vector",
-                "category",
-                "scope",
-                "importance",
-                "timestamp",
-                "metadata",
-            ])
-            : this.table.vectorSearch(vector).distanceType("cosine").limit(fetchLimit);
-        // Apply scope filter if provided
-        if (scopeFilter && scopeFilter.length > 0) {
-            const scopeConditions = scopeFilter
-                .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
-                .join(" OR ");
-            query = query.where(`(${scopeConditions}) OR scope IS NULL`); // NULL for backward compatibility
-        }
-        const results = await query.toArray();
-        const mapped = [];
-        for (const row of results) {
-            const rowVector = toNumberVector(row.vector);
-            if (rowVector.length !== vector.length)
-                continue;
-            const distance = this.disableNativeCosine
-                ? 1 - cosineSimilarity(vector, rowVector)
-                : Number(row._distance ?? 0);
-            const score = 1 / (1 + distance);
-            if (score < minScore)
-                continue;
-            const rowScope = row.scope ?? "global";
-            // Double-check scope filter in application layer
-            if (scopeFilter &&
-                scopeFilter.length > 0 &&
-                !scopeFilter.includes(rowScope)) {
-                continue;
+        let mapped = [];
+        while (true) {
+            let query = this.disableNativeCosine
+                ? this.table.query().select([
+                    "id",
+                    "text",
+                    "vector",
+                    "category",
+                    "scope",
+                    "importance",
+                    "timestamp",
+                    "metadata",
+                ])
+                : this.table.vectorSearch(vector).distanceType("cosine").limit(fetchLimit);
+            if (scopeFilter && scopeFilter.length > 0) {
+                const scopeConditions = scopeFilter
+                    .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+                    .join(" OR ");
+                query = query.where(`(${scopeConditions}) OR scope IS NULL`);
             }
-            const entry = {
-                id: row.id,
-                text: row.text,
-                vector: rowVector,
-                category: row.category,
-                scope: rowScope,
-                importance: Number(row.importance),
-                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-                metadata: row.metadata || "{}",
-            };
-            if (lifecycleMode &&
-                !isMemoryVisibleInMode(parseSmartMetadata(entry.metadata, entry), lifecycleMode)) {
-                continue;
+            const results = await query.toArray();
+            mapped = [];
+            for (const row of results) {
+                const rowVector = toNumberVector(row.vector);
+                if (rowVector.length !== vector.length)
+                    continue;
+                const distance = this.disableNativeCosine
+                    ? 1 - cosineSimilarity(vector, rowVector)
+                    : Number(row._distance ?? 0);
+                const score = 1 / (1 + distance);
+                if (score < minScore)
+                    continue;
+                const rowScope = row.scope ?? "global";
+                // Double-check scope filter in application layer
+                if (scopeFilter &&
+                    scopeFilter.length > 0 &&
+                    !scopeFilter.includes(rowScope)) {
+                    continue;
+                }
+                const entry = {
+                    id: row.id,
+                    text: row.text,
+                    vector: rowVector,
+                    category: row.category,
+                    scope: rowScope,
+                    importance: Number(row.importance),
+                    timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+                    metadata: row.metadata || "{}",
+                };
+                if (lifecycleMode &&
+                    !isMemoryVisibleInMode(parseSmartMetadata(entry.metadata, entry), lifecycleMode)) {
+                    continue;
+                }
+                mapped.push({ entry, score });
+                if (!this.disableNativeCosine && mapped.length >= safeLimit)
+                    break;
             }
-            mapped.push({ entry, score });
-            if (!this.disableNativeCosine && mapped.length >= safeLimit)
+            if (this.disableNativeCosine ||
+                !lifecycleMode ||
+                mapped.length >= safeLimit ||
+                results.length < fetchLimit ||
+                fetchLimit >= MAX_LIFECYCLE_SEARCH_CANDIDATES) {
+                if (lifecycleMode &&
+                    mapped.length < safeLimit &&
+                    results.length >= MAX_LIFECYCLE_SEARCH_CANDIDATES) {
+                    console.warn("memory-lancedb-pro: lifecycle vector search reached candidate safety ceiling");
+                }
                 break;
+            }
+            fetchLimit = Math.min(fetchLimit * 2, MAX_LIFECYCLE_SEARCH_CANDIDATES);
         }
         if (this.disableNativeCosine) {
             mapped.sort((a, b) => b.score - a.score);
@@ -1254,51 +1270,64 @@ export class MemoryStore {
         const safeLimit = clampInt(limit, 1, 20);
         const lifecycleMode = options?.lifecycleMode ?? (options?.excludeInactive ? "active" : undefined);
         // Over-fetch when filtering inactive records to avoid crowding
-        const fetchLimit = lifecycleMode ? Math.min(safeLimit * 20, 200) : safeLimit;
+        let fetchLimit = lifecycleMode ? Math.min(safeLimit * 20, 200) : safeLimit;
         if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
             return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
         }
         try {
-            // Use FTS query type explicitly
-            let searchQuery = this.table.search(query, "fts").limit(fetchLimit);
-            // Apply scope filter if provided
-            if (scopeFilter && scopeFilter.length > 0) {
-                const scopeConditions = scopeFilter
-                    .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
-                    .join(" OR ");
-                searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);
-            }
-            const results = await searchQuery.toArray();
-            const mapped = [];
-            for (const row of results) {
-                const rowScope = row.scope ?? "global";
-                // Double-check scope filter in application layer
-                if (scopeFilter &&
-                    scopeFilter.length > 0 &&
-                    !scopeFilter.includes(rowScope)) {
-                    continue;
+            let mapped = [];
+            while (true) {
+                let searchQuery = this.table.search(query, "fts").limit(fetchLimit);
+                if (scopeFilter && scopeFilter.length > 0) {
+                    const scopeConditions = scopeFilter
+                        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+                        .join(" OR ");
+                    searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);
                 }
-                // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
-                // LanceDB may return BigInt for numeric columns; coerce safely.
-                const rawScore = row._score != null ? Number(row._score) : 0;
-                const normalizedScore = rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
-                const entry = {
-                    id: row.id,
-                    text: row.text,
-                    vector: row.vector,
-                    category: row.category,
-                    scope: rowScope,
-                    importance: Number(row.importance),
-                    timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-                    metadata: row.metadata || "{}",
-                };
-                if (lifecycleMode &&
-                    !isMemoryVisibleInMode(parseSmartMetadata(entry.metadata, entry), lifecycleMode)) {
-                    continue;
+                const results = await searchQuery.toArray();
+                mapped = [];
+                for (const row of results) {
+                    const rowScope = row.scope ?? "global";
+                    // Double-check scope filter in application layer
+                    if (scopeFilter &&
+                        scopeFilter.length > 0 &&
+                        !scopeFilter.includes(rowScope)) {
+                        continue;
+                    }
+                    // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
+                    // LanceDB may return BigInt for numeric columns; coerce safely.
+                    const rawScore = row._score != null ? Number(row._score) : 0;
+                    const normalizedScore = rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
+                    const entry = {
+                        id: row.id,
+                        text: row.text,
+                        vector: row.vector,
+                        category: row.category,
+                        scope: rowScope,
+                        importance: Number(row.importance),
+                        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+                        metadata: row.metadata || "{}",
+                    };
+                    if (lifecycleMode &&
+                        !isMemoryVisibleInMode(parseSmartMetadata(entry.metadata, entry), lifecycleMode)) {
+                        continue;
+                    }
+                    mapped.push({ entry, score: normalizedScore });
+                    if (mapped.length >= safeLimit)
+                        break;
                 }
-                mapped.push({ entry, score: normalizedScore });
-                if (mapped.length >= safeLimit)
+                if (!lifecycleMode ||
+                    mapped.length >= safeLimit ||
+                    results.length < fetchLimit ||
+                    fetchLimit >= MAX_LIFECYCLE_SEARCH_CANDIDATES) {
+                    if (lifecycleMode &&
+                        mapped.length < safeLimit &&
+                        results.length >= MAX_LIFECYCLE_SEARCH_CANDIDATES) {
+                        console.warn("memory-lancedb-pro: lifecycle BM25 search reached candidate safety ceiling");
+                    }
                     break;
+                }
+                fetchLimit = Math.min(fetchLimit * 2, MAX_LIFECYCLE_SEARCH_CANDIDATES);
             }
             if (mapped.length > 0) {
                 return mapped;
