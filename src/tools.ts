@@ -18,8 +18,10 @@ import {
   appendRelation,
   buildSmartMetadata,
   deriveFactKey,
+  isMemoryVisibleInMode,
   parseSmartMetadata,
   stringifySmartMetadata,
+  type MemoryRecallMode,
 } from "./smart-metadata.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
@@ -181,6 +183,7 @@ async function retrieveWithRetry(
     scopeFilter?: string[];
     category?: string;
     source?: "manual" | "auto-recall" | "cli";
+    includeInactive?: boolean;
   },
   countStore?: () => Promise<number>,
 ): Promise<RetrievalResult[]> {
@@ -579,6 +582,15 @@ export function registerMemoryRecallTool(
           }),
         ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+        mode: Type.Optional(
+          Type.Union([
+            Type.Literal("active"),
+            Type.Literal("history"),
+            Type.Literal("review"),
+          ], {
+            description: "Lifecycle view: active (default), history, or review.",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -588,6 +600,7 @@ export function registerMemoryRecallTool(
           maxCharsPerItem = 180,
           scope,
           category,
+          mode = "active",
         } = params as {
           query: string;
           limit?: number;
@@ -595,6 +608,7 @@ export function registerMemoryRecallTool(
           maxCharsPerItem?: number;
           scope?: string;
           category?: string;
+          mode?: MemoryRecallMode;
         };
 
         try {
@@ -622,23 +636,33 @@ export function registerMemoryRecallTool(
             }
           }
 
-          const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
+          const candidateLimit = Math.min(20, Math.max(safeLimit * 4, safeLimit));
+          const candidates = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
             query,
-            limit: safeLimit,
+            limit: candidateLimit,
             scopeFilter,
             category,
             source: "manual",
+            includeInactive: mode !== "active",
           }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
+          const results = candidates
+            .filter((result) =>
+              isMemoryVisibleInMode(
+                parseSmartMetadata(result.entry.metadata, result.entry),
+                mode,
+              ),
+            )
+            .slice(0, safeLimit);
 
           if (results.length === 0) {
             return {
               content: [{ type: "text", text: "No relevant memories found." }],
-              details: { count: 0, query, scopes: scopeFilter },
+              details: { count: 0, query, scopes: scopeFilter, lifecycleMode: mode },
             };
           }
 
           const now = Date.now();
-          await Promise.allSettled(
+          if (mode === "active") await Promise.allSettled(
             results.map((result) => {
               const meta = parseSmartMetadata(result.entry.metadata, result.entry);
               return runtimeContext.store.patchMetadata(
@@ -672,7 +696,8 @@ export function registerMemoryRecallTool(
               const rendered = includeFullText
                 ? inline
                 : truncateText(inline, safeCharsPerItem);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
+              const lifecycleTag = mode === "active" ? "" : ` [state:${metadata.state}]`;
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}]${lifecycleTag} ${rendered}`;
             })
             .join("\n");
 
@@ -699,6 +724,7 @@ export function registerMemoryRecallTool(
               scopes: scopeFilter,
               retrievalMode: runtimeContext.retriever.getConfig().mode,
               recallMode: includeFullText ? "full" : "summary",
+              lifecycleMode: mode,
             },
           };
         } catch (error) {
@@ -922,7 +948,7 @@ export function registerMemoryStoreTool(
                 suppressed_until_turn: 0,
                 valid_from: now,
                 fact_key: factKey,
-                supersedes: oldEntry.id,
+                supersedes: [oldEntry.id],
                 relations: appendRelation([], {
                   type: "supersedes",
                   targetId: oldEntry.id,
@@ -1364,7 +1390,7 @@ export function registerMemoryUpdateTool(
                     confidence: importance !== undefined ? clamp01(importance, 0.7) : meta.confidence,
                     valid_from: now,
                     fact_key: factKey,
-                    supersedes: resolvedId,
+                    supersedes: [resolvedId],
                     relations: appendRelation([], {
                       type: "supersedes",
                       targetId: resolvedId,

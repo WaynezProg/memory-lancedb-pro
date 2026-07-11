@@ -105,6 +105,8 @@ export interface RetrievalContext {
   category?: string;
   /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated, "cli" for CLI commands. */
   source?: "manual" | "auto-recall" | "cli";
+  /** Include inactive/expired rows for explicitly labeled history or review tools. */
+  includeInactive?: boolean;
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -583,7 +585,7 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source } = context;
+    const { query, limit, scopeFilter, category, source, includeInactive = false } = context;
     const safeLimit = clampInt(limit, 1, 20);
     this.lastDiagnostics = null;
     const diagnostics: RetrievalDiagnostics = {
@@ -633,6 +635,7 @@ export class MemoryRetriever {
           category,
           trace,
           diagnostics,
+          includeInactive,
         );
       } else if (this.config.mode === "vector" || !hasFtsSupport) {
         results = await this.vectorOnlyRetrieval(
@@ -642,6 +645,7 @@ export class MemoryRetriever {
           category,
           trace,
           diagnostics,
+          includeInactive,
         );
       } else {
         results = await this.hybridRetrieval(
@@ -652,6 +656,7 @@ export class MemoryRetriever {
           trace,
           source,
           diagnostics,
+          includeInactive,
         );
       }
 
@@ -747,6 +752,7 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
+    includeInactive = false,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
     try {
@@ -758,7 +764,7 @@ export class MemoryRetriever {
         candidatePoolSize,
         this.config.minScore,
         scopeFilter,
-        { excludeInactive: true },
+        { excludeInactive: !includeInactive },
       );
 
       const filtered = category
@@ -768,6 +774,7 @@ export class MemoryRetriever {
       // Filter expired memories early — before scoring — so they don't
       // occupy candidate slots that should go to live memories.
       const unexpired = filtered.filter((r) => {
+        if (includeInactive) return true;
         const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
         return !isMemoryExpired(metadata);
       });
@@ -834,6 +841,7 @@ export class MemoryRetriever {
     category?: string,
     trace?: TraceCollector,
     diagnostics?: RetrievalDiagnostics,
+    includeInactive = false,
   ): Promise<RetrievalResult[]> {
     const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
 
@@ -842,7 +850,7 @@ export class MemoryRetriever {
       query,
       candidatePoolSize,
       scopeFilter,
-      { excludeInactive: true },
+      { excludeInactive: !includeInactive },
     );
     const categoryFiltered = category
       ? bm25Results.filter((r) => r.entry.category === category)
@@ -853,6 +861,7 @@ export class MemoryRetriever {
     });
     // Filter expired memories early — before scoring
     const unexpiredResults = mustContainFiltered.filter((r) => {
+      if (includeInactive) return true;
       const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
       return !isMemoryExpired(metadata);
     });
@@ -937,6 +946,7 @@ export class MemoryRetriever {
     trace?: TraceCollector,
     source?: RetrievalContext["source"],
     diagnostics?: RetrievalDiagnostics,
+    includeInactive = false,
   ): Promise<RetrievalResult[]> {
     let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
     try {
@@ -956,12 +966,14 @@ export class MemoryRetriever {
           candidatePoolSize,
           scopeFilter,
           category,
+          includeInactive,
         ),
         this.runBM25Search(
           bm25Query,
           candidatePoolSize,
           scopeFilter,
           category,
+          includeInactive,
         ),
       ]);
 
@@ -1036,6 +1048,7 @@ export class MemoryRetriever {
 
       // Filter expired memories early — before rerank/scoring
       const filtered = scoreFiltered.filter((r) => {
+        if (includeInactive) return true;
         const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
         return !isMemoryExpired(metadata);
       });
@@ -1124,13 +1137,14 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
+    includeInactive = false,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
     const results = await this.store.vectorSearch(
       queryVector,
       limit,
       0.1,
       scopeFilter,
-      { excludeInactive: true },
+      { excludeInactive: !includeInactive },
     );
 
     // Filter by category if specified
@@ -1149,8 +1163,9 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
+    includeInactive = false,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.bm25Search(query, limit, scopeFilter, { excludeInactive: true });
+    const results = await this.store.bm25Search(query, limit, scopeFilter, { excludeInactive: !includeInactive });
 
     // Filter by category if specified
     const filtered = category

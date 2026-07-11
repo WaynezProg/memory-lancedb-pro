@@ -26,7 +26,19 @@ export interface MemoryRelation {
   targetId: string;
 }
 
-export type MemoryState = "pending" | "confirmed" | "archived";
+export type MemoryState =
+  | "pending"
+  | "confirmed"
+  | "superseded"
+  | "obsolete_preference"
+  | "conflicting"
+  | "archived";
+export type MemoryRecallMode = "active" | "history" | "review";
+export type SupersessionReason =
+  | "method_migration"
+  | "preference_changed"
+  | "config_drift"
+  | "newer_decision";
 export type MemoryLayer = "durable" | "working" | "reflection" | "archive";
 export type MemorySource =
   | "manual"
@@ -49,8 +61,10 @@ export interface SmartMemoryMetadata {
   memory_temporal_type?: "static" | "dynamic";
   valid_until?: number;
   fact_key?: string;
-  supersedes?: string;
+  supersedes?: string[];
   superseded_by?: string;
+  supersession_reason?: SupersessionReason;
+  canonical_key?: string;
   relations?: MemoryRelation[];
   source_session?: string;
   state: MemoryState;
@@ -110,10 +124,41 @@ function normalizeState(value: unknown): MemoryState {
   switch (value) {
     case "pending":
     case "confirmed":
+    case "superseded":
+    case "obsolete_preference":
+    case "conflicting":
     case "archived":
       return value;
     default:
       return "confirmed";
+  }
+}
+
+export function normalizeSupersedes(value: unknown): string[] {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? [value]
+      : [];
+  return Array.from(
+    new Set(
+      values
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function normalizeSupersessionReason(value: unknown): SupersessionReason | undefined {
+  switch (value) {
+    case "method_migration":
+    case "preference_changed":
+    case "config_drift":
+    case "newer_decision":
+      return value;
+    default:
+      return undefined;
   }
 }
 
@@ -256,6 +301,26 @@ export function isMemoryExpired(
   return metadata.valid_until != null && metadata.valid_until <= at;
 }
 
+export function isMemoryVisibleInMode(
+  metadata: SmartMemoryMetadata,
+  mode: MemoryRecallMode,
+  at = Date.now(),
+): boolean {
+  if (mode === "active") {
+    return (
+      metadata.state === "confirmed" &&
+      isMemoryActiveAt(metadata, at) &&
+      !isMemoryExpired(metadata, at)
+    );
+  }
+  if (mode === "history") {
+    return ["superseded", "obsolete_preference", "archived"].includes(
+      metadata.state,
+    );
+  }
+  return metadata.state === "pending" || metadata.state === "conflicting";
+}
+
 export function parseSmartMetadata(
   rawMetadata: string | undefined,
   entry: EntryLike = {},
@@ -325,8 +390,10 @@ export function parseSmartMetadata(
           : memoryCategory,
         l0,
       ),
-    supersedes: normalizeOptionalString(parsed.supersedes),
+    supersedes: normalizeSupersedes(parsed.supersedes),
     superseded_by: normalizeOptionalString(parsed.superseded_by),
+    supersession_reason: normalizeSupersessionReason(parsed.supersession_reason),
+    canonical_key: normalizeOptionalString(parsed.canonical_key),
     source_session:
       typeof parsed.source_session === "string" ? parsed.source_session : undefined,
     state,
@@ -411,11 +478,19 @@ export function buildSmartMetadata(
     supersedes:
       patch.supersedes === undefined
         ? base.supersedes
-        : normalizeOptionalString(patch.supersedes),
+        : normalizeSupersedes(patch.supersedes),
     superseded_by:
       patch.superseded_by === undefined
         ? base.superseded_by
         : normalizeOptionalString(patch.superseded_by),
+    supersession_reason:
+      patch.supersession_reason === undefined
+        ? base.supersession_reason
+        : normalizeSupersessionReason(patch.supersession_reason),
+    canonical_key:
+      patch.canonical_key === undefined
+        ? base.canonical_key
+        : normalizeOptionalString(patch.canonical_key),
     source_session:
       typeof patch.source_session === "string"
         ? patch.source_session

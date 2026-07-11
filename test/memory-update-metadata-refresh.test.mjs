@@ -447,7 +447,7 @@ async function runTests() {
     const new6 = await store.getById(result6.newId, scopeFilter);
     assert.equal(new6.text, newText6, "new record should have updated text");
     const newMeta6 = parseSmartMetadata(new6.metadata, new6);
-    assert.equal(newMeta6.supersedes, entry6.id, "supersede chain should be intact");
+    assert.deepEqual(newMeta6.supersedes, [entry6.id], "supersede chain should be intact");
     assert.equal(isMemoryActiveAt(newMeta6), true, "new record should be active");
 
     console.log("  OK supersede path unaffected");

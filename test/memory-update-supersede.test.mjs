@@ -171,7 +171,7 @@ async function runTests() {
     assert.ok(newAfter, "new record should exist");
     assert.equal(newAfter.text, newText, "new record should have updated text");
     const newMeta = parseSmartMetadata(newAfter.metadata, newAfter);
-    assert.equal(newMeta.supersedes, oldEntry.id, "new record should link to old");
+    assert.deepEqual(newMeta.supersedes, [oldEntry.id], "new record should link to old");
     assert.ok(newMeta.valid_from, "new record should have valid_from");
     assert.equal(isMemoryActiveAt(newMeta), true, "new record should be active");
     assert.equal(newMeta.fact_key, oldMeta.fact_key, "fact_key should match");
@@ -298,7 +298,7 @@ async function runTests() {
 
     const entityNew = await store.getById(result4.newId, scopeFilter);
     const entityNewMeta = parseSmartMetadata(entityNew.metadata, entityNew);
-    assert.equal(entityNewMeta.supersedes, entityEntry.id);
+    assert.deepEqual(entityNewMeta.supersedes, [entityEntry.id]);
     assert.equal(isMemoryActiveAt(entityNewMeta), true);
 
     console.log("  ✅ entities text change creates supersede chain");

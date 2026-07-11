@@ -180,7 +180,7 @@ async function runTests() {
 
     const newEntry = store._entries.get(res.details.id);
     const newMeta = parseSmartMetadata(newEntry.metadata, newEntry);
-    assert.equal(newMeta.supersedes, oldId, "new memory should link to old");
+    assert.deepEqual(newMeta.supersedes, [oldId], "new memory should link to old");
     console.log("  ✅ new memory has supersedes link");
   }
 

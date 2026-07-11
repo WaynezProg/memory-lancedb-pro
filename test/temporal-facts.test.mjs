@@ -186,7 +186,7 @@ async function runTest() {
     const currentMeta = parseSmartMetadata(currentEntry.metadata, currentEntry);
     const historicalMeta = parseSmartMetadata(historicalEntry.metadata, historicalEntry);
 
-    assert.equal(currentMeta.supersedes, historicalEntry.id);
+    assert.deepEqual(currentMeta.supersedes, [historicalEntry.id]);
     assert.equal(historicalMeta.superseded_by, currentEntry.id);
     assert.ok(historicalMeta.invalidated_at, "historical entry should have invalidated_at");
     assert.ok(currentMeta.valid_from >= historicalMeta.valid_from);

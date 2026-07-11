@@ -367,6 +367,49 @@ describe("recall text cleanup", () => {
     assert.ok(res.details.memories[1].sources.bm25);
   });
 
+  it("filters lifecycle state before the requested top-N and labels history", async () => {
+    const now = Date.now();
+    const results = [
+      {
+        entry: {
+          id: "old-1",
+          text: "old method",
+          category: "decision",
+          scope: "global",
+          importance: 0.9,
+          timestamp: now - 2,
+          metadata: JSON.stringify({ state: "superseded", invalidated_at: now - 1 }),
+        },
+        score: 0.99,
+      },
+      {
+        entry: {
+          id: "current-1",
+          text: "current method",
+          category: "decision",
+          scope: "global",
+          importance: 0.8,
+          timestamp: now,
+          metadata: JSON.stringify({ state: "confirmed" }),
+        },
+        score: 0.9,
+      },
+    ];
+
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(results));
+    const active = await tool.execute(null, { query: "method", limit: 1 });
+    const history = await tool.execute(null, {
+      query: "method",
+      limit: 1,
+      mode: "history",
+    });
+
+    assert.equal(active.details.memories[0].id, "current-1");
+    assert.match(active.content[0].text, /current method/);
+    assert.equal(history.details.memories[0].id, "old-1");
+    assert.match(history.content[0].text, /\[state:superseded\]/);
+  });
+
   it("removes retrieval metadata from every rendered memory_recall line", async () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeExpandedResults()));
     const res = await tool.execute(null, { query: "test with multiple memories" });
