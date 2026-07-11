@@ -288,8 +288,7 @@ async function runTest() {
     console.log("  ✅ active fact survives crowding by 8 inactive versions (limit=5)");
 
     console.log("\nTest 5: state-only archived rows cannot crowd active retrieval...");
-    for (let i = 0; i < 8; i++) {
-      await store.store({
+    await store.bulkStore(Array.from({ length: 205 }, (_, i) => ({
         text: `饮品偏好：归档版本${i}`,
         vector: activeVector,
         category: "preference",
@@ -306,8 +305,7 @@ async function runTest() {
             },
           ),
         ),
-      });
-    }
+      })));
 
     const stateCrowdedResults = await retriever.retrieve({
       query: "饮品偏好",
@@ -322,7 +320,36 @@ async function runTest() {
       const meta = parseSmartMetadata(result.entry.metadata, result.entry);
       assert.equal(meta.state, "confirmed");
     }
-    console.log("  ✅ active fact survives state-only archive crowding");
+    const bm25CrowdedResults = await store.bm25Search(
+      "饮品偏好",
+      5,
+      ["test"],
+      { lifecycleMode: "active" },
+    );
+    assert.ok(bm25CrowdedResults.some((result) => result.entry.id === currentEntry.id));
+
+    const hybridRetriever = createRetriever(store, embedder, {
+      mode: "hybrid",
+      rerank: "none",
+      minScore: 0.1,
+      hardMinScore: 0,
+      filterNoise: false,
+      recencyHalfLifeDays: 0,
+      recencyWeight: 0,
+      lengthNormAnchor: 0,
+      timeDecayHalfLifeDays: 0,
+      reinforcementFactor: 0,
+      maxHalfLifeMultiplier: 1,
+    });
+    const hybridCrowdedResults = await hybridRetriever.retrieve({
+      query: "饮品偏好",
+      limit: 5,
+      scopeFilter: ["test"],
+      source: "cli",
+      lifecycleMode: "active",
+    });
+    assert.ok(hybridCrowdedResults.some((result) => result.entry.id === currentEntry.id));
+    console.log("  ✅ active fact survives 205 state-only archive rows");
 
     console.log("\n=== Temporal facts tests passed! ===");
   } finally {

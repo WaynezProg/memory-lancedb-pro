@@ -58,6 +58,8 @@ interface SearchLifecycleOptions {
   lifecycleMode?: MemoryRecallMode;
 }
 
+const MAX_LIFECYCLE_SEARCH_CANDIDATES = 5000;
+
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
@@ -1404,7 +1406,7 @@ export class MemoryStore {
     // because superseded historical rows can crowd out active ones.
     const lifecycleMode = options?.lifecycleMode ?? (options?.excludeInactive ? "active" : undefined);
     const overFetchMultiplier = lifecycleMode ? 20 : 10;
-    const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
+    let fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
     if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
       console.warn(
@@ -1412,31 +1414,31 @@ export class MemoryStore {
       );
       this.nativeCosineFallbackLogged = true;
     }
-    let query = this.disableNativeCosine
-      ? this.table!.query().select([
-        "id",
-        "text",
-        "vector",
-        "category",
-        "scope",
-        "importance",
-        "timestamp",
-        "metadata",
-      ])
-      : this.table!.vectorSearch(vector).distanceType("cosine").limit(fetchLimit);
+    let mapped: MemorySearchResult[] = [];
+    while (true) {
+      let query = this.disableNativeCosine
+        ? this.table!.query().select([
+          "id",
+          "text",
+          "vector",
+          "category",
+          "scope",
+          "importance",
+          "timestamp",
+          "metadata",
+        ])
+        : this.table!.vectorSearch(vector).distanceType("cosine").limit(fetchLimit);
 
-    // Apply scope filter if provided
-    if (scopeFilter && scopeFilter.length > 0) {
-      const scopeConditions = scopeFilter
-        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
-        .join(" OR ");
-      query = query.where(`(${scopeConditions}) OR scope IS NULL`); // NULL for backward compatibility
-    }
+      if (scopeFilter && scopeFilter.length > 0) {
+        const scopeConditions = scopeFilter
+          .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+          .join(" OR ");
+        query = query.where(`(${scopeConditions}) OR scope IS NULL`);
+      }
 
-    const results = await query.toArray();
-    const mapped: MemorySearchResult[] = [];
-
-    for (const row of results) {
+      const results = await query.toArray();
+      mapped = [];
+      for (const row of results) {
       const rowVector = toNumberVector(row.vector);
       if (rowVector.length !== vector.length) continue;
       const distance = this.disableNativeCosine
@@ -1475,9 +1477,27 @@ export class MemoryStore {
         continue;
       }
 
-      mapped.push({ entry, score });
+        mapped.push({ entry, score });
 
-      if (!this.disableNativeCosine && mapped.length >= safeLimit) break;
+        if (!this.disableNativeCosine && mapped.length >= safeLimit) break;
+      }
+      if (
+        this.disableNativeCosine ||
+        !lifecycleMode ||
+        mapped.length >= safeLimit ||
+        results.length < fetchLimit ||
+        fetchLimit >= MAX_LIFECYCLE_SEARCH_CANDIDATES
+      ) {
+        if (
+          lifecycleMode &&
+          mapped.length < safeLimit &&
+          results.length >= MAX_LIFECYCLE_SEARCH_CANDIDATES
+        ) {
+          console.warn("memory-lancedb-pro: lifecycle vector search reached candidate safety ceiling");
+        }
+        break;
+      }
+      fetchLimit = Math.min(fetchLimit * 2, MAX_LIFECYCLE_SEARCH_CANDIDATES);
     }
 
     if (this.disableNativeCosine) {
@@ -1500,30 +1520,29 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 20);
     const lifecycleMode = options?.lifecycleMode ?? (options?.excludeInactive ? "active" : undefined);
     // Over-fetch when filtering inactive records to avoid crowding
-    const fetchLimit = lifecycleMode ? Math.min(safeLimit * 20, 200) : safeLimit;
+    let fetchLimit = lifecycleMode ? Math.min(safeLimit * 20, 200) : safeLimit;
 
     if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
       return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     }
 
     try {
-      // Use FTS query type explicitly
-      let searchQuery = this.table!.search(query, "fts").limit(fetchLimit);
+      let mapped: MemorySearchResult[] = [];
+      while (true) {
+        let searchQuery = this.table!.search(query, "fts").limit(fetchLimit);
 
-      // Apply scope filter if provided
-      if (scopeFilter && scopeFilter.length > 0) {
-        const scopeConditions = scopeFilter
-          .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
-          .join(" OR ");
-        searchQuery = searchQuery.where(
-          `(${scopeConditions}) OR scope IS NULL`,
-        );
-      }
+        if (scopeFilter && scopeFilter.length > 0) {
+          const scopeConditions = scopeFilter
+            .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+            .join(" OR ");
+          searchQuery = searchQuery.where(
+            `(${scopeConditions}) OR scope IS NULL`,
+          );
+        }
 
-      const results = await searchQuery.toArray();
-      const mapped: MemorySearchResult[] = [];
-
-      for (const row of results) {
+        const results = await searchQuery.toArray();
+        mapped = [];
+        for (const row of results) {
         const rowScope = (row.scope as string | undefined) ?? "global";
 
         // Double-check scope filter in application layer
@@ -1559,9 +1578,26 @@ export class MemoryStore {
           continue;
         }
 
-        mapped.push({ entry, score: normalizedScore });
+          mapped.push({ entry, score: normalizedScore });
 
-        if (mapped.length >= safeLimit) break;
+          if (mapped.length >= safeLimit) break;
+        }
+        if (
+          !lifecycleMode ||
+          mapped.length >= safeLimit ||
+          results.length < fetchLimit ||
+          fetchLimit >= MAX_LIFECYCLE_SEARCH_CANDIDATES
+        ) {
+          if (
+            lifecycleMode &&
+            mapped.length < safeLimit &&
+            results.length >= MAX_LIFECYCLE_SEARCH_CANDIDATES
+          ) {
+            console.warn("memory-lancedb-pro: lifecycle BM25 search reached candidate safety ceiling");
+          }
+          break;
+        }
+        fetchLimit = Math.min(fetchLimit * 2, MAX_LIFECYCLE_SEARCH_CANDIDATES);
       }
 
       if (mapped.length > 0) {
