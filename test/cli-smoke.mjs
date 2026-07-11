@@ -163,6 +163,20 @@ async function runCliSmoke() {
   ]);
   assert.match(out2, /Import completed: 0 imported, 1 skipped/, out2);
 
+  const noEmbedderProgram = new Command();
+  noEmbedderProgram.exitOverride();
+  createMemoryCLI({ ...context, embedder: undefined })({ program: noEmbedderProgram });
+  const previousExitCode = process.exitCode;
+  await noEmbedderProgram.parseAsync([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "import",
+    importFile,
+  ]);
+  assert.equal(process.exitCode, 1, "missing embedder must set a failing exit code");
+  process.exitCode = previousExitCode;
+
   const { parseAccessMetadata, buildUpdatedMetadata, computeEffectiveHalfLife } =
     jiti("../src/access-tracker.ts");
 
