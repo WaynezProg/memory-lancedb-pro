@@ -1358,10 +1358,11 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter = [options.scope];
         }
 
+        const matchingStats = await context.store.stats(scopeFilter);
         const memories = await context.store.list(
           scopeFilter,
           options.category,
-          1000 // Large limit for export
+          matchingStats.totalCount,
         );
 
         const exportData = {
@@ -1422,6 +1423,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         let imported = 0;
         let skipped = 0;
+        let failed = 0;
 
         if (!context.embedder) {
           console.error("Import requires an embedder (not available in basic CLI mode).");
@@ -1514,11 +1516,14 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
             imported++;
           } catch (error) {
             console.warn(`Failed to import memory: ${error}`);
-            skipped++;
+            failed++;
           }
         }
 
-        console.log(`Import completed: ${imported} imported, ${skipped} skipped`);
+        console.log(
+          `Import completed: ${imported} imported, ${skipped} skipped, ${failed} failed`,
+        );
+        if (failed > 0) process.exitCode = 1;
       } catch (error) {
         console.error("Import failed:", error);
         process.exit(1);
