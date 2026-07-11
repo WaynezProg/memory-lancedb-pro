@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { isNoise } from "./noise-filter.js";
 import { stripEnvelopeMetadata } from "./smart-extractor.js";
 import { isSystemBypassId, resolveScopeFilter, parseAgentIdFromSessionKey } from "./scopes.js";
-import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, } from "./smart-metadata.js";
+import { appendRelation, buildSmartMetadata, deriveFactKey, isMemoryVisibleInMode, parseSmartMetadata, stringifySmartMetadata, } from "./smart-metadata.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
 import { appendSelfImprovementEntry, countSelfImprovementEntries, DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES, ensureSelfImprovementLearningFiles, } from "./self-improvement-files.js";
@@ -443,9 +443,16 @@ export function registerMemoryRecallTool(api, context) {
                     description: "Specific memory scope to search in (optional)",
                 })),
                 category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+                mode: Type.Optional(Type.Union([
+                    Type.Literal("active"),
+                    Type.Literal("history"),
+                    Type.Literal("review"),
+                ], {
+                    description: "Lifecycle view: active (default), history, or review.",
+                })),
             }),
             async execute(_toolCallId, params) {
-                const { query, limit = 3, includeFullText = false, maxCharsPerItem = 180, scope, category, } = params;
+                const { query, limit = 3, includeFullText = false, maxCharsPerItem = 180, scope, category, mode = "active", } = params;
                 try {
                     const safeLimit = includeFullText
                         ? clampInt(limit, 1, 20)
@@ -470,36 +477,42 @@ export function registerMemoryRecallTool(api, context) {
                             };
                         }
                     }
-                    const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
+                    const candidateLimit = Math.min(20, Math.max(safeLimit * 4, safeLimit));
+                    const candidates = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
                         query,
-                        limit: safeLimit,
+                        limit: candidateLimit,
                         scopeFilter,
                         category,
                         source: "manual",
+                        lifecycleMode: mode,
                     }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
+                    const results = candidates
+                        .filter((result) => isMemoryVisibleInMode(parseSmartMetadata(result.entry.metadata, result.entry), mode))
+                        .slice(0, safeLimit);
                     if (results.length === 0) {
                         return {
                             content: [{ type: "text", text: "No relevant memories found." }],
-                            details: { count: 0, query, scopes: scopeFilter },
+                            details: { count: 0, query, scopes: scopeFilter, lifecycleMode: mode },
                         };
                     }
                     const now = Date.now();
-                    await Promise.allSettled(results.map((result) => {
-                        const meta = parseSmartMetadata(result.entry.metadata, result.entry);
-                        return runtimeContext.store.patchMetadata(result.entry.id, {
-                            access_count: meta.access_count + 1,
-                            last_accessed_at: now,
-                            last_confirmed_use_at: now,
-                            bad_recall_count: 0,
-                            suppressed_until_turn: 0,
-                            // Manual recall is a strong positive signal — clear active
-                            // ms-based suppression too, matching pre-Tier1 semantics
-                            // where zeroing the turn field cleared the only suppression
-                            // mechanism. Without this, governance keeps suppressing a
-                            // memory the user just explicitly searched for.
-                            suppressed_until_ms: 0,
-                        }, scopeFilter);
-                    }));
+                    if (mode === "active")
+                        await Promise.allSettled(results.map((result) => {
+                            const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+                            return runtimeContext.store.patchMetadata(result.entry.id, {
+                                access_count: meta.access_count + 1,
+                                last_accessed_at: now,
+                                last_confirmed_use_at: now,
+                                bad_recall_count: 0,
+                                suppressed_until_turn: 0,
+                                // Manual recall is a strong positive signal — clear active
+                                // ms-based suppression too, matching pre-Tier1 semantics
+                                // where zeroing the turn field cleared the only suppression
+                                // mechanism. Without this, governance keeps suppressing a
+                                // memory the user just explicitly searched for.
+                                suppressed_until_ms: 0,
+                            }, scopeFilter);
+                        }));
                     const text = results
                         .map((r, i) => {
                         const categoryTag = getDisplayCategoryTag(r.entry);
@@ -511,7 +524,8 @@ export function registerMemoryRecallTool(api, context) {
                         const rendered = includeFullText
                             ? inline
                             : truncateText(inline, safeCharsPerItem);
-                        return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
+                        const lifecycleTag = mode === "active" ? "" : ` [state:${metadata.state}]`;
+                        return `${i + 1}. [${r.entry.id}] [${categoryTag}]${lifecycleTag} ${rendered}`;
                     })
                         .join("\n");
                     const serializedMemories = sanitizeMemoryForSerialization(results);
@@ -536,6 +550,7 @@ export function registerMemoryRecallTool(api, context) {
                             scopes: scopeFilter,
                             retrievalMode: runtimeContext.retriever.getConfig().mode,
                             recallMode: includeFullText ? "full" : "summary",
+                            lifecycleMode: mode,
                         },
                     };
                 }
@@ -715,7 +730,7 @@ export function registerMemoryStoreTool(api, context) {
                             suppressed_until_turn: 0,
                             valid_from: now,
                             fact_key: factKey,
-                            supersedes: oldEntry.id,
+                            supersedes: [oldEntry.id],
                             relations: appendRelation([], {
                                 type: "supersedes",
                                 targetId: oldEntry.id,
@@ -1074,7 +1089,7 @@ export function registerMemoryUpdateTool(api, context) {
                                 confidence: importance !== undefined ? clamp01(importance, 0.7) : meta.confidence,
                                 valid_from: now,
                                 fact_key: factKey,
-                                supersedes: resolvedId,
+                                supersedes: [resolvedId],
                                 relations: appendRelation([], {
                                     type: "supersedes",
                                     targetId: resolvedId,

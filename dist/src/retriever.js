@@ -5,7 +5,7 @@
 import { computeEffectiveHalfLife, parseAccessMetadata, } from "./access-tracker.js";
 import { filterNoise } from "./noise-filter.js";
 import { expandQuery } from "./query-expander.js";
-import { getDecayableFromEntry, isMemoryExpired, parseSmartMetadata, toLifecycleMemory, } from "./smart-metadata.js";
+import { getDecayableFromEntry, isMemoryVisibleInMode, parseSmartMetadata, toLifecycleMemory, } from "./smart-metadata.js";
 import { TraceCollector } from "./retrieval-trace.js";
 // ============================================================================
 // Default Configuration
@@ -329,8 +329,15 @@ export class MemoryRetriever {
     getStatsCollector() {
         return this._statsCollector;
     }
+    async resolveFtsSupport() {
+        const storeWithRefresh = this.store;
+        if (typeof storeWithRefresh.refreshFtsSupport === "function") {
+            return await storeWithRefresh.refreshFtsSupport();
+        }
+        return this.store.hasFtsSupport;
+    }
     async retrieve(context) {
-        const { query, limit, scopeFilter, category, source } = context;
+        const { query, limit, scopeFilter, category, source, lifecycleMode = "active" } = context;
         const safeLimit = clampInt(limit, 1, 20);
         this.lastDiagnostics = null;
         const diagnostics = {
@@ -363,17 +370,20 @@ export class MemoryRetriever {
         try {
             // Create trace only when stats collector is active (zero overhead otherwise)
             const trace = this._statsCollector ? new TraceCollector() : undefined;
+            const hasFtsSupport = this.config.mode === "vector"
+                ? this.store.hasFtsSupport
+                : await this.resolveFtsSupport();
             // Check if query contains tag prefixes -> use BM25-only + mustContain
             const tagTokens = this.extractTagTokens(query);
             let results;
             if (tagTokens.length > 0) {
-                results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics);
+                results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics, lifecycleMode);
             }
-            else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-                results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, diagnostics);
+            else if (this.config.mode === "vector" || !hasFtsSupport) {
+                results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, diagnostics, lifecycleMode);
             }
             else {
-                results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace, source, diagnostics);
+                results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace, source, diagnostics, lifecycleMode);
             }
             diagnostics.finalResultCount = results.length;
             diagnostics.dropSummary = buildDropSummary(diagnostics);
@@ -381,7 +391,7 @@ export class MemoryRetriever {
             if (trace && this._statsCollector) {
                 const mode = tagTokens.length > 0
                     ? "bm25"
-                    : (this.config.mode === "vector" || !this.store.hasFtsSupport)
+                    : (this.config.mode === "vector" || !hasFtsSupport)
                         ? "vector"
                         : "hybrid";
                 const finalTrace = trace.finalize(query, mode);
@@ -407,22 +417,25 @@ export class MemoryRetriever {
      * Always collects a trace regardless of stats collector state.
      */
     async retrieveWithTrace(context) {
-        const { query, limit, scopeFilter, category, source } = context;
+        const { query, limit, scopeFilter, category, source, lifecycleMode = "active" } = context;
         const safeLimit = clampInt(limit, 1, 20);
         const trace = new TraceCollector();
         const tagTokens = this.extractTagTokens(query);
         let results;
+        const hasFtsSupport = this.config.mode === "vector"
+            ? this.store.hasFtsSupport
+            : await this.resolveFtsSupport();
         if (tagTokens.length > 0) {
-            results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace);
+            results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace, undefined, lifecycleMode);
         }
-        else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-            results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace);
+        else if (this.config.mode === "vector" || !hasFtsSupport) {
+            results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, undefined, lifecycleMode);
         }
         else {
-            results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace);
+            results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace, source, undefined, lifecycleMode);
         }
         const mode = tagTokens.length > 0 ? "bm25"
-            : (this.config.mode === "vector" || !this.store.hasFtsSupport) ? "vector" : "hybrid";
+            : (this.config.mode === "vector" || !hasFtsSupport) ? "vector" : "hybrid";
         const finalTrace = trace.finalize(query, mode);
         if (this._statsCollector) {
             this._statsCollector.recordQuery(finalTrace, source || "debug");
@@ -440,22 +453,19 @@ export class MemoryRetriever {
         const matches = query.match(regex);
         return matches || [];
     }
-    async vectorOnlyRetrieval(query, limit, scopeFilter, category, trace, diagnostics) {
+    async vectorOnlyRetrieval(query, limit, scopeFilter, category, trace, diagnostics, lifecycleMode = "active") {
         let failureStage = "vector.embedQuery";
         try {
             const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
             const queryVector = await this.embedder.embedQuery(query);
             failureStage = "vector.vectorSearch";
-            const results = await this.store.vectorSearch(queryVector, candidatePoolSize, this.config.minScore, scopeFilter, { excludeInactive: true });
+            const results = await this.store.vectorSearch(queryVector, candidatePoolSize, this.config.minScore, scopeFilter, { lifecycleMode });
             const filtered = category
                 ? results.filter((r) => r.entry.category === category)
                 : results;
             // Filter expired memories early — before scoring — so they don't
             // occupy candidate slots that should go to live memories.
-            const unexpired = filtered.filter((r) => {
-                const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
-                return !isMemoryExpired(metadata);
-            });
+            const unexpired = filtered.filter((r) => isMemoryVisibleInMode(parseSmartMetadata(r.entry.metadata, r.entry), lifecycleMode));
             if (diagnostics) {
                 diagnostics.vectorResultCount = unexpired.length;
                 diagnostics.fusedResultCount = unexpired.length;
@@ -511,10 +521,10 @@ export class MemoryRetriever {
             throw error;
         }
     }
-    async bm25OnlyRetrieval(query, tagTokens, limit, scopeFilter, category, trace, diagnostics) {
+    async bm25OnlyRetrieval(query, tagTokens, limit, scopeFilter, category, trace, diagnostics, lifecycleMode = "active") {
         const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
         trace?.startStage("bm25_search", []);
-        const bm25Results = await this.store.bm25Search(query, candidatePoolSize, scopeFilter, { excludeInactive: true });
+        const bm25Results = await this.store.bm25Search(query, candidatePoolSize, scopeFilter, { lifecycleMode });
         const categoryFiltered = category
             ? bm25Results.filter((r) => r.entry.category === category)
             : bm25Results;
@@ -523,10 +533,7 @@ export class MemoryRetriever {
             return tagTokens.every((t) => textLower.includes(t.toLowerCase()));
         });
         // Filter expired memories early — before scoring
-        const unexpiredResults = mustContainFiltered.filter((r) => {
-            const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
-            return !isMemoryExpired(metadata);
-        });
+        const unexpiredResults = mustContainFiltered.filter((r) => isMemoryVisibleInMode(parseSmartMetadata(r.entry.metadata, r.entry), lifecycleMode));
         const mapped = unexpiredResults.map((result, index) => ({
             ...result,
             sources: { bm25: { score: result.score, rank: index + 1 } },
@@ -593,7 +600,7 @@ export class MemoryRetriever {
             diagnostics.stageCounts.afterDiversity = deduplicated.length;
         return finalResults;
     }
-    async hybridRetrieval(query, limit, scopeFilter, category, trace, source, diagnostics) {
+    async hybridRetrieval(query, limit, scopeFilter, category, trace, source, diagnostics, lifecycleMode = "active") {
         let failureStage = "hybrid.embedQuery";
         try {
             const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
@@ -606,8 +613,8 @@ export class MemoryRetriever {
             trace?.startStage("parallel_search", []);
             failureStage = "hybrid.parallelSearch";
             const settledResults = await Promise.allSettled([
-                this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category),
-                this.runBM25Search(bm25Query, candidatePoolSize, scopeFilter, category),
+                this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category, lifecycleMode),
+                this.runBM25Search(bm25Query, candidatePoolSize, scopeFilter, category, lifecycleMode),
             ]);
             const vectorResult_ = settledResults[0];
             const bm25Result_ = settledResults[1];
@@ -670,10 +677,7 @@ export class MemoryRetriever {
             const scoreFiltered = fusedResults.filter((r) => r.score >= this.config.minScore);
             trace?.endStage(scoreFiltered.map((r) => r.entry.id), scoreFiltered.map((r) => r.score));
             // Filter expired memories early — before rerank/scoring
-            const filtered = scoreFiltered.filter((r) => {
-                const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
-                return !isMemoryExpired(metadata);
-            });
+            const filtered = scoreFiltered.filter((r) => isMemoryVisibleInMode(parseSmartMetadata(r.entry.metadata, r.entry), lifecycleMode));
             if (diagnostics)
                 diagnostics.stageCounts.afterMinScore = filtered.length;
             const rerankInput = this.config.rerank !== "none" ? filtered.slice(0, limit * 2) : filtered;
@@ -752,8 +756,8 @@ export class MemoryRetriever {
             throw error;
         }
     }
-    async runVectorSearch(queryVector, limit, scopeFilter, category) {
-        const results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter, { excludeInactive: true });
+    async runVectorSearch(queryVector, limit, scopeFilter, category, lifecycleMode = "active") {
+        const results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter, { lifecycleMode });
         // Filter by category if specified
         const filtered = category
             ? results.filter((r) => r.entry.category === category)
@@ -763,8 +767,8 @@ export class MemoryRetriever {
             rank: index + 1,
         }));
     }
-    async runBM25Search(query, limit, scopeFilter, category) {
-        const results = await this.store.bm25Search(query, limit, scopeFilter, { excludeInactive: true });
+    async runBM25Search(query, limit, scopeFilter, category, lifecycleMode = "active") {
+        const results = await this.store.bm25Search(query, limit, scopeFilter, { lifecycleMode });
         // Filter by category if specified
         const filtered = category
             ? results.filter((r) => r.entry.category === category)
@@ -863,8 +867,9 @@ export class MemoryRetriever {
                 const model = this.config.rerankModel || "jina-reranker-v3";
                 const endpoint = this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
                 const documents = results.map((r) => r.entry.text);
+                const rerankTopN = Math.min(results.length, Math.max(1, this.config.candidatePoolSize));
                 // Build provider-specific request
-                const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey || "", model, query, documents, results.length);
+                const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey || "", model, query, documents, rerankTopN);
                 // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
@@ -1293,14 +1298,14 @@ export class MemoryRetriever {
             return {
                 success: true,
                 mode: this.config.mode,
-                hasFtsSupport: this.store.hasFtsSupport,
+                hasFtsSupport: await this.resolveFtsSupport(),
             };
         }
         catch (error) {
             return {
                 success: false,
                 mode: this.config.mode,
-                hasFtsSupport: this.store.hasFtsSupport,
+                hasFtsSupport: await this.resolveFtsSupport(),
                 error: error instanceof Error ? error.message : String(error),
             };
         }

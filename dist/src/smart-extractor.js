@@ -816,7 +816,7 @@ export class SmartExtractor {
                 suppressed_until_turn: 0,
                 valid_from: now,
                 fact_key: factKey,
-                supersedes: matchId,
+                supersedes: [matchId],
                 relations: appendRelation([], {
                     type: "supersedes",
                     targetId: matchId,

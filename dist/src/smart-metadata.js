@@ -25,10 +25,35 @@ function normalizeState(value) {
     switch (value) {
         case "pending":
         case "confirmed":
+        case "superseded":
+        case "obsolete_preference":
+        case "conflicting":
         case "archived":
             return value;
         default:
             return "confirmed";
+    }
+}
+export function normalizeSupersedes(value) {
+    const values = Array.isArray(value)
+        ? value
+        : typeof value === "string"
+            ? [value]
+            : [];
+    return Array.from(new Set(values
+        .filter((item) => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)));
+}
+function normalizeSupersessionReason(value) {
+    switch (value) {
+        case "method_migration":
+        case "preference_changed":
+        case "config_drift":
+        case "newer_decision":
+            return value;
+        default:
+            return undefined;
     }
 }
 function normalizeSource(value) {
@@ -142,6 +167,21 @@ export function isMemoryActiveAt(metadata, at = Date.now()) {
 export function isMemoryExpired(metadata, at = Date.now()) {
     return metadata.valid_until != null && metadata.valid_until <= at;
 }
+export function isMemoryVisibleInMode(metadata, mode, at = Date.now()) {
+    if (mode === "active") {
+        return (metadata.state === "confirmed" &&
+            isMemoryActiveAt(metadata, at) &&
+            !isMemoryExpired(metadata, at));
+    }
+    if (mode === "history") {
+        if (["superseded", "obsolete_preference", "archived"].includes(metadata.state)) {
+            return true;
+        }
+        return (metadata.state === "confirmed" &&
+            (!isMemoryActiveAt(metadata, at) || isMemoryExpired(metadata, at)));
+    }
+    return metadata.state === "pending" || metadata.state === "conflicting";
+}
 export function parseSmartMetadata(rawMetadata, entry = {}) {
     let parsed = {};
     if (rawMetadata) {
@@ -195,8 +235,10 @@ export function parseSmartMetadata(rawMetadata, entry = {}) {
             deriveFactKey(typeof parsed.memory_category === "string"
                 ? parsed.memory_category
                 : memoryCategory, l0),
-        supersedes: normalizeOptionalString(parsed.supersedes),
+        supersedes: normalizeSupersedes(parsed.supersedes),
         superseded_by: normalizeOptionalString(parsed.superseded_by),
+        supersession_reason: normalizeSupersessionReason(parsed.supersession_reason),
+        canonical_key: normalizeOptionalString(parsed.canonical_key),
         source_session: typeof parsed.source_session === "string" ? parsed.source_session : undefined,
         state,
         source,
@@ -261,10 +303,16 @@ export function buildSmartMetadata(entry, patch = {}) {
             deriveFactKey(nextCategory, l0Abstract),
         supersedes: patch.supersedes === undefined
             ? base.supersedes
-            : normalizeOptionalString(patch.supersedes),
+            : normalizeSupersedes(patch.supersedes),
         superseded_by: patch.superseded_by === undefined
             ? base.superseded_by
             : normalizeOptionalString(patch.superseded_by),
+        supersession_reason: patch.supersession_reason === undefined
+            ? base.supersession_reason
+            : normalizeSupersessionReason(patch.supersession_reason),
+        canonical_key: patch.canonical_key === undefined
+            ? base.canonical_key
+            : normalizeOptionalString(patch.canonical_key),
         source_session: typeof patch.source_session === "string"
             ? patch.source_session
             : base.source_session,
