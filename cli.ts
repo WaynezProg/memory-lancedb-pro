@@ -58,13 +58,16 @@ interface CLIContext {
 // ============================================================================
 
 function getPluginVersion(): string {
-  try {
-    const pkgUrl = new URL("./package.json", import.meta.url);
-    const pkg = JSON.parse(readFileSync(pkgUrl, "utf8")) as { version?: string };
-    return pkg.version || "unknown";
-  } catch {
-    return "unknown";
+  for (const relativePath of ["./package.json", "../package.json"]) {
+    try {
+      const pkgUrl = new URL(relativePath, import.meta.url);
+      const pkg = JSON.parse(readFileSync(pkgUrl, "utf8")) as { version?: string };
+      if (pkg.version) return pkg.version;
+    } catch {
+      // Source loads beside package.json; compiled dist loads one directory below it.
+    }
   }
+  return "unknown";
 }
 
 function clampInt(value: number, min: number, max: number): number {

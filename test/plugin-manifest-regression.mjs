@@ -174,6 +174,20 @@ assert.ok(
   "manifest should expose the dreaming runtime slash command alias while owning the memory slot",
 );
 
+const memoryProAlias = (manifest.commandAliases ?? []).find(
+  (entry) => entry?.name === "memory-pro",
+);
+assert.equal(
+  memoryProAlias?.cliCommand,
+  "memory-pro",
+  "manifest should route the memory-pro CLI command without loading unrelated plugins",
+);
+assert.equal(
+  memoryProAlias?.kind,
+  undefined,
+  "memory-pro is a CLI command, not a runtime slash command",
+);
+
 assert.equal(
   manifest.version,
   pkg.version,

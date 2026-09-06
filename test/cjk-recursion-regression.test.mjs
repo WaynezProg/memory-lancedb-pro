@@ -273,20 +273,16 @@ async function testBatchEmbeddingStillWorks() {
 async function testOllamaAbortWithNativeFetch() {
   console.log("Test 8: Ollama native fetch respects external AbortSignal (PR354 fix regression)");
 
-  // Author's analysis: the previous test used withServer() on a random port but hardcoded
-  // http://127.0.0.1:11434/v1 for the Embedder — so the request always hit "connection refused"
-  // immediately and never touched the slow handler. This test fixes that by:
-  // 1. Binding the mock server directly to 127.0.0.1:11434 (so isOllamaProvider() is true)
-  // 2. Delaying the response by 5 seconds
-  // 3. Passing an external AbortSignal that fires after 2 seconds
-  // 4. Asserting total time ≈ 2s (proving abort interrupted the slow request)
+  // Use a random port so this regression does not conflict with a real local
+  // Ollama service on 127.0.0.1:11434. The /ollama path still exercises the
+  // Ollama native-fetch branch.
 
   const SLOW_DELAY_MS = 5_000;
   const ABORT_AFTER_MS = 2_000;
   const DIMS = 1024;
 
   const server = http.createServer((req, res) => {
-    if (req.url === "/v1/embeddings" && req.method === "POST") {
+    if (req.url === "/ollama/api/embeddings" && req.method === "POST") {
       const timer = setTimeout(() => {
         if (res.writableEnded) return; // already aborted
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -301,22 +297,24 @@ async function testOllamaAbortWithNativeFetch() {
     res.end("not found");
   });
 
-  // Bind directly to 127.0.0.1:11434 so isOllamaProvider() returns true
-  await new Promise((resolve) => server.listen(11434, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : undefined;
+  assert.ok(port, "mock Ollama server should expose a random port");
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: "http://127.0.0.1:11434/v1",
+      baseURL: `http://127.0.0.1:${port}/ollama/v1`,
       dimensions: DIMS,
     });
 
     assert.equal(
       embedder.isOllamaProvider ? embedder.isOllamaProvider() : false,
       true,
-      "isOllamaProvider should return true for 127.0.0.1:11434"
+      "isOllamaProvider should return true for /ollama baseURL"
     );
 
     const start = Date.now();

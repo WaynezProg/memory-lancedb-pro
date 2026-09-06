@@ -2027,15 +2027,27 @@ export class MemoryStore {
     patch: MetadataPatch,
     scopeFilter?: string[],
   ): Promise<MemoryEntry | null> {
-    const existing = await this.getById(id, scopeFilter);
-    if (!existing) return null;
+    await this.ensureInitialized();
 
-    const metadata = buildSmartMetadata(existing, patch);
-    return this.update(
-      id,
-      { metadata: stringifySmartMetadata(metadata) },
-      scopeFilter,
-    );
+    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+      const existing = await this.getById(id, scopeFilter);
+      if (!existing) return null;
+
+      const metadata = buildSmartMetadata(existing, patch);
+      const nextMetadata = stringifySmartMetadata(metadata);
+      const resolvedId = escapeSqlLiteral(existing.id);
+      const result = await this.table!.update({
+        where: `id = '${resolvedId}'`,
+        values: { metadata: nextMetadata },
+      });
+      const rowsUpdated =
+        (result as any)?.rowsUpdated ??
+        (result as any)?.numUpdatedRows ??
+        (result as any)?.updatedRows;
+      if (typeof rowsUpdated === "number" && rowsUpdated < 1) return null;
+
+      return { ...existing, metadata: nextMetadata };
+    }));
   }
 
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {

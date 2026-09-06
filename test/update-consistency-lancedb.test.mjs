@@ -179,6 +179,51 @@ describe("MemoryStore update rollback (real LanceDB backend)", () => {
     assert.ok(warnings.some((msg) => /write-back failed/i.test(msg)));
   });
 
+  it("patchMetadata updates metadata in-place without delete/add rewrite", async () => {
+    const { store, entry } = await createStoreWithEntry();
+    let addCount = 0;
+    let deleteCount = 0;
+    let updateCount = 0;
+
+    const restoreAdd = wrapTableMethod(store, "add", (original) => async (...args) => {
+      addCount += 1;
+      return original(...args);
+    });
+    const restoreDelete = wrapTableMethod(store, "delete", (original) => async (...args) => {
+      deleteCount += 1;
+      return original(...args);
+    });
+    const restoreUpdate = wrapTableMethod(store, "update", (original) => async (...args) => {
+      updateCount += 1;
+      return original(...args);
+    });
+
+    const updated = await store.patchMetadata(
+      entry.id,
+      {
+        state: "archived",
+        memory_layer: "archive",
+        archive_reason: "compact_duplicate",
+      },
+      ["global"],
+    );
+
+    restoreAdd();
+    restoreDelete();
+    restoreUpdate();
+
+    assert.equal(addCount, 0);
+    assert.equal(deleteCount, 0);
+    assert.equal(updateCount, 1);
+    assert.equal(updated?.id, entry.id);
+
+    const persisted = await store.getById(entry.id);
+    const metadata = JSON.parse(persisted?.metadata ?? "{}");
+    assert.equal(metadata.state, "archived");
+    assert.equal(metadata.archive_reason, "compact_duplicate");
+    assert.equal(persisted?.text, "original memory");
+  });
+
   it("after a successful update, getById/list can still read the record", async () => {
     const { store, entry } = await createStoreWithEntry();
 

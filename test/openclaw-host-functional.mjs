@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -165,11 +164,16 @@ async function createLegacyDb(baseDir) {
 
 async function main() {
   const runDir = mkdtempSync(path.join(tmpdir(), "memory-lancedb-pro-openclaw-host-"));
+  const homeDir = path.join(runDir, "home");
   const profile = `mempro-host-${Date.now()}`;
-  const profileDir = path.join(os.homedir(), `.openclaw-${profile}`);
+  const profileDir = path.join(homeDir, `.openclaw-${profile}`);
   const configFile = path.join(profileDir, "openclaw.json");
   const importFile = path.join(runDir, "import.json");
   const exportFile = path.join(runDir, "export.json");
+  const run = (args, options = {}) => runOpenClaw(profile, args, {
+    ...options,
+    env: { HOME: homeDir, ...(options.env || {}) },
+  });
   let server;
 
   try {
@@ -248,57 +252,56 @@ async function main() {
     mkdirSync(profileDir, { recursive: true });
     writeFileSync(configFile, JSON.stringify(config, null, 2));
 
-    const validateOutput = await runOpenClaw(profile, ["config", "validate"]);
+    const validateOutput = await run(["config", "validate"]);
     assert.match(validateOutput, /Config valid/);
 
-    const infoOutput = await runOpenClaw(profile, ["plugins", "info", "memory-lancedb-pro"]);
+    const infoOutput = await run(["plugins", "info", "memory-lancedb-pro"]);
     assert.match(infoOutput, /Status:\s+loaded/);
-    assert.match(infoOutput, /CLI commands:\s+memory-pro/);
 
-    const versionOutput = stripPluginLogs(await runOpenClaw(profile, ["memory-pro", "version"]));
+    const versionOutput = stripPluginLogs(await run(["memory-pro", "version"]));
     assert.equal(versionOutput, packageJson.version);
 
-    const importOutput = await runOpenClaw(profile, ["memory-pro", "import", importFile, "--scope", "global"]);
+    const importOutput = await run(["memory-pro", "import", importFile, "--scope", "global"]);
     assert.match(importOutput, /Import completed: 2 imported, 0 skipped/);
 
-    const listBeforeDelete = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "list", "--scope", "global", "--json"]));
+    const listBeforeDelete = parseJsonOutput(await run(["memory-pro", "list", "--scope", "global", "--json"]));
     assert.equal(listBeforeDelete.length, 2);
 
-    const searchOutput = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "search", "乌龙茶", "--scope", "global", "--json"]));
+    const searchOutput = parseJsonOutput(await run(["memory-pro", "search", "乌龙茶", "--scope", "global", "--json"]));
     assert.ok(searchOutput.length >= 1);
     assert.equal(searchOutput[0].entry.id, "11111111-1111-4111-8111-111111111111");
 
-    const statsBeforeDelete = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "stats", "--scope", "global", "--json"]));
+    const statsBeforeDelete = parseJsonOutput(await run(["memory-pro", "stats", "--scope", "global", "--json"]));
     assert.equal(statsBeforeDelete.memory.totalCount, 2);
 
-    const exportOutput = await runOpenClaw(profile, ["memory-pro", "export", "--scope", "global", "--output", exportFile]);
+    const exportOutput = await run(["memory-pro", "export", "--scope", "global", "--output", exportFile]);
     assert.match(exportOutput, /Exported 2 memories/);
     const exported = JSON.parse(readFileSync(exportFile, "utf8"));
     assert.equal(exported.count, 2);
 
-    const deleteOutput = await runOpenClaw(profile, ["memory-pro", "delete", "22222222-2222-4222-8222-222222222222", "--scope", "global"]);
+    const deleteOutput = await run(["memory-pro", "delete", "22222222-2222-4222-8222-222222222222", "--scope", "global"]);
     assert.match(deleteOutput, /deleted successfully/i);
 
-    const listAfterDelete = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "list", "--scope", "global", "--json"]));
+    const listAfterDelete = parseJsonOutput(await run(["memory-pro", "list", "--scope", "global", "--json"]));
     assert.equal(listAfterDelete.length, 1);
     assert.equal(listAfterDelete[0].id, "11111111-1111-4111-8111-111111111111");
 
-    const statsAfterDelete = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "stats", "--scope", "global", "--json"]));
+    const statsAfterDelete = parseJsonOutput(await run(["memory-pro", "stats", "--scope", "global", "--json"]));
     assert.equal(statsAfterDelete.memory.totalCount, 1);
 
     const legacyPath = await createLegacyDb(runDir);
-    const migrateOutput = await runOpenClaw(profile, ["memory-pro", "migrate", "run", "--source", legacyPath]);
+    const migrateOutput = await run(["memory-pro", "migrate", "run", "--source", legacyPath]);
     assert.match(migrateOutput, /Status:\s+Success/);
     assert.match(migrateOutput, /Migrated:\s+1/);
 
-    const verifyOutput = await runOpenClaw(profile, ["memory-pro", "migrate", "verify", "--source", legacyPath]);
+    const verifyOutput = await run(["memory-pro", "migrate", "verify", "--source", legacyPath]);
     assert.match(verifyOutput, /Valid:\s+Yes/);
 
-    const listAfterMigrate = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "list", "--scope", "global", "--json"]));
+    const listAfterMigrate = parseJsonOutput(await run(["memory-pro", "list", "--scope", "global", "--json"]));
     assert.equal(listAfterMigrate.length, 2);
     assert.ok(listAfterMigrate.some((entry) => entry.id === "legacy-1"));
 
-    const statsAfterMigrate = parseJsonOutput(await runOpenClaw(profile, ["memory-pro", "stats", "--scope", "global", "--json"]));
+    const statsAfterMigrate = parseJsonOutput(await run(["memory-pro", "stats", "--scope", "global", "--json"]));
     assert.equal(statsAfterMigrate.memory.totalCount, 2);
 
     console.log("OK: openclaw host functional test passed");

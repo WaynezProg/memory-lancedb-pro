@@ -7,7 +7,17 @@
   "skills": [
     "./skills"
   ],
+  "activation": {
+    "onStartup": true,
+    "onCommands": [
+      "memory-pro"
+    ]
+  },
   "commandAliases": [
+    {
+      "name": "memory-pro",
+      "cliCommand": "memory-pro"
+    },
     {
       "name": "dreaming",
       "kind": "runtime-slash",

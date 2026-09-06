@@ -16,14 +16,18 @@ import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSup
 // Utility Functions
 // ============================================================================
 function getPluginVersion() {
-    try {
-        const pkgUrl = new URL("./package.json", import.meta.url);
-        const pkg = JSON.parse(readFileSync(pkgUrl, "utf8"));
-        return pkg.version || "unknown";
+    for (const relativePath of ["./package.json", "../package.json"]) {
+        try {
+            const pkgUrl = new URL(relativePath, import.meta.url);
+            const pkg = JSON.parse(readFileSync(pkgUrl, "utf8"));
+            if (pkg.version)
+                return pkg.version;
+        }
+        catch {
+            // Source loads beside package.json; compiled dist loads one directory below it.
+        }
     }
-    catch {
-        return "unknown";
-    }
+    return "unknown";
 }
 function clampInt(value, min, max) {
     const n = Number.isFinite(value) ? value : min;

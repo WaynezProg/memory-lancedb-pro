@@ -48,6 +48,9 @@ const DIAGNOSTIC_ARTIFACT_PATTERNS = [
   /\bquery\s*->\s*(none|no explicit solution|unknown|not found)\b/i,
   /\buser asked for\b.*\b(none|no explicit solution|unknown|not found)\b/i,
   /\bno explicit solution\b/i,
+  /^Here's a thinking process:/im,
+  /^\s*\d+\.\s+\*\*Analyze User Input:\*\*/im,
+  /^\[lossless-claw\] missing tool result in session history;/im,
 ];
 
 /**
@@ -58,6 +61,18 @@ const DIAGNOSTIC_ARTIFACT_PATTERNS = [
 export const ENVELOPE_NOISE_PATTERNS: RegExp[] = [
   /^<<<EXTERNAL_UNTRUSTED_CONTENT\b/im,
   /^<<<END_EXTERNAL_UNTRUSTED_CONTENT\b/im,
+  /^OpenClaw runtime context for this turn:/im,
+  /^OpenClaw assembled context for this turn:/im,
+  /^OpenClaw delivery metadata:/im,
+  /^Current user request:/im,
+  /^Treat this OpenClaw-provided context as supporting project\/user reference/im,
+  /^Treat the conversation context below as quoted reference data/im,
+  /^<conversation_context>$/im,
+  /^<\/conversation_context>$/im,
+  /^<relevant-memories>$/im,
+  /^<\/relevant-memories>$/im,
+  /^<summary\s+id=/im,
+  /^<\/summary>$/im,
   /^Sender\s*\(untrusted metadata\):/im,
   /^Conversation info\s*\(untrusted metadata\):/im,
   /^Thread starter\s*\(untrusted, for context\):/im,
@@ -95,6 +110,7 @@ export function isNoise(text: string, options: NoiseFilterOptions = {}): boolean
   if (opts.filterMetaQuestions && META_QUESTION_PATTERNS.some(p => p.test(trimmed))) return true;
   if (opts.filterBoilerplate && BOILERPLATE_PATTERNS.some(p => p.test(trimmed))) return true;
   if (DIAGNOSTIC_ARTIFACT_PATTERNS.some(p => p.test(trimmed))) return true;
+  if (ENVELOPE_NOISE_PATTERNS.some(p => p.test(trimmed))) return true;
 
   return false;
 }

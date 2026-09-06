@@ -19,12 +19,12 @@ const { Embedder } = jiti("../src/embedder.ts");
  * instead of the OpenAI SDK. Native fetch properly closes TCP on abort.
  *
  * This test verifies the fix by:
- * 1. Mocking a slow Ollama server on 127.0.0.1:11434 (5s delay)
+ * 1. Mocking a slow Ollama-shaped server on a random local port (5s delay)
  * 2. Calling embedPassage with an AbortSignal that fires after 2s
  * 3. Asserting total time ≈ 2s (not 5s) — proving abort interrupted the request
  *
- * Note: The mock server is bound to 127.0.0.1:11434 (not a random port) so that
- * isOllamaProvider() returns true and the native fetch path is exercised.
+ * The base URL includes /ollama so isOllamaProvider() returns true without
+ * conflicting with a real local Ollama service on 127.0.0.1:11434.
  */
 test("Ollama embedWithNativeFetch aborts slow request within expected time", async () => {
   const SLOW_DELAY_MS = 5_000;
@@ -32,7 +32,7 @@ test("Ollama embedWithNativeFetch aborts slow request within expected time", asy
   const DIMS = 1024;
 
   const server = http.createServer((req, res) => {
-    if (req.url === "/v1/embeddings" && req.method === "POST") {
+    if (req.url === "/ollama/api/embeddings" && req.method === "POST") {
       const timer = setTimeout(() => {
         if (res.writableEnded) return; // already aborted
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -47,21 +47,23 @@ test("Ollama embedWithNativeFetch aborts slow request within expected time", asy
     res.end("not found");
   });
 
-  // Bind to 127.0.0.1:11434 so isOllamaProvider() returns true → native fetch path
-  await new Promise((resolve) => server.listen(11434, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : undefined;
+  assert.ok(port, "mock Ollama server should expose a random port");
 
   try {
     const embedder = new Embedder({
       provider: "openai-compatible",
       apiKey: "test-key",
       model: "mxbai-embed-large",
-      baseURL: "http://127.0.0.1:11434/v1",
+      baseURL: `http://127.0.0.1:${port}/ollama/v1`,
       dimensions: DIMS,
     });
 
     assert.ok(
       embedder.isOllamaProvider(),
-      "isOllamaProvider() should return true for http://127.0.0.1:11434",
+      "isOllamaProvider() should return true for /ollama baseURL",
     );
 
     const start = Date.now();

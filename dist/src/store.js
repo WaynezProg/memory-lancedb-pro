@@ -1657,11 +1657,25 @@ export class MemoryStore {
         }
     }
     async patchMetadata(id, patch, scopeFilter) {
-        const existing = await this.getById(id, scopeFilter);
-        if (!existing)
-            return null;
-        const metadata = buildSmartMetadata(existing, patch);
-        return this.update(id, { metadata: stringifySmartMetadata(metadata) }, scopeFilter);
+        await this.ensureInitialized();
+        return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+            const existing = await this.getById(id, scopeFilter);
+            if (!existing)
+                return null;
+            const metadata = buildSmartMetadata(existing, patch);
+            const nextMetadata = stringifySmartMetadata(metadata);
+            const resolvedId = escapeSqlLiteral(existing.id);
+            const result = await this.table.update({
+                where: `id = '${resolvedId}'`,
+                values: { metadata: nextMetadata },
+            });
+            const rowsUpdated = result?.rowsUpdated ??
+                result?.numUpdatedRows ??
+                result?.updatedRows;
+            if (typeof rowsUpdated === "number" && rowsUpdated < 1)
+                return null;
+            return { ...existing, metadata: nextMetadata };
+        }));
     }
     async bulkDelete(scopeFilter, beforeTimestamp) {
         await this.ensureInitialized();
