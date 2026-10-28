@@ -296,19 +296,22 @@ type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
 // Default Configuration
 // ============================================================================
 
+function getOpenClawStateDir(): string {
+  const configured = process.env.OPENCLAW_STATE_DIR?.trim();
+  return configured || "/Users/waynetu/openclaw2.0/state";
+}
+
 function getDefaultDbPath(): string {
-  const home = homedir();
-  return join(home, ".openclaw", "memory", "lancedb-pro");
+  return join(getOpenClawStateDir(), "memory", "lancedb-pro");
 }
 
 function getDefaultWorkspaceDir(): string {
-  const home = homedir();
-  return join(home, ".openclaw", "workspace");
+  const configured = process.env.OPENCLAW_WORKSPACE_DIR?.trim();
+  return configured || join(getOpenClawStateDir(), "..", "workspaces", "personal", "main");
 }
 
 function getDefaultMdMirrorDir(): string {
-  const home = homedir();
-  return join(home, ".openclaw", "memory", "md-mirror");
+  return join(getOpenClawStateDir(), "memory", "md-mirror");
 }
 
 function resolveWorkspaceDirFromContext(context: Record<string, unknown> | undefined): string {
@@ -1761,32 +1764,36 @@ type AgentWorkspaceMap = Record<string, string>;
 function resolveAgentWorkspaceMap(api: OpenClawPluginApi): AgentWorkspaceMap {
   const map: AgentWorkspaceMap = {};
 
-  // Try api.config first (runtime config)
-  const agents = Array.isArray((api as any).config?.agents?.list)
-    ? (api as any).config.agents.list
-    : [];
-
-  for (const agent of agents) {
-    if (agent?.id && typeof agent.workspace === "string") {
-      map[String(agent.id)] = agent.workspace;
-    }
-  }
-
-  // Fallback: read from openclaw.json (respect OPENCLAW_HOME if set)
-  if (Object.keys(map).length === 0) {
-    try {
-      const openclawHome = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
-      const configPath = join(openclawHome, "openclaw.json");
-      const raw = readFileSync(configPath, "utf8");
-      const parsed = JSON.parse(raw);
-      const list = parsed?.agents?.list;
-      if (Array.isArray(list)) {
-        for (const agent of list) {
-          if (agent?.id && typeof agent.workspace === "string") {
-            map[String(agent.id)] = agent.workspace;
-          }
+  const addWorkspaces = (agents: unknown) => {
+    if (Array.isArray(agents)) {
+      for (const agent of agents) {
+        if (agent?.id && typeof agent.workspace === "string") {
+          map[String(agent.id)] = agent.workspace;
         }
       }
+      return;
+    }
+    if (agents && typeof agents === "object") {
+      for (const [id, agent] of Object.entries(agents as Record<string, unknown>)) {
+        if (agent && typeof agent === "object" && typeof (agent as any).workspace === "string") {
+          map[id] = (agent as any).workspace;
+        }
+      }
+    }
+  };
+
+  // Runtime config uses agents.entries in current OpenClaw; preserve legacy list support.
+  addWorkspaces((api as any).config?.agents?.entries);
+  addWorkspaces((api as any).config?.agents?.list);
+
+  // Fallback: read the configured state root, never an unrelated legacy home.
+  if (Object.keys(map).length === 0) {
+    try {
+      const configPath = join(getOpenClawStateDir(), "openclaw.json");
+      const raw = readFileSync(configPath, "utf8");
+      const parsed = JSON.parse(raw);
+      addWorkspaces(parsed?.agents?.entries);
+      addWorkspaces(parsed?.agents?.list);
     } catch {
       /* silent */
     }

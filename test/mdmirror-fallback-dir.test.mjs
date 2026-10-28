@@ -1,7 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
 
@@ -21,9 +20,9 @@ describe("mdMirror fallback directory", () => {
     assert.ok(path.isAbsolute(dir), `expected absolute path, got: ${dir}`);
   });
 
-  it("resolves inside ~/.openclaw/memory/md-mirror", () => {
+  it("uses the isolated state directory when no runtime override is present", () => {
     const dir = getDefaultMdMirrorDir();
-    const expected = path.join(homedir(), ".openclaw", "memory", "md-mirror");
+    const expected = "/Users/waynetu/openclaw2.0/state/memory/md-mirror";
     assert.equal(dir, expected);
   });
 

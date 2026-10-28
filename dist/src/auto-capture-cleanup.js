@@ -21,6 +21,25 @@ function stripLeadingInboundMetadata(text) {
         return text;
     }
     let normalized = text;
+    // Since OpenClaw 2026.9.3 labels carry a stable provenance marker instead
+    // of the old '(untrusted metadata)' suffix. Strip only leading carriers;
+    // ordinary user headings and marker-shaped text later in the request stay.
+    while (true) {
+        const header = /^[^\n]+ ⟦openclaw:ctx⟧[ \t]*\n/.exec(normalized);
+        if (!header)
+            break;
+        const body = normalized.slice(header[0].length);
+        if (body.startsWith("```json\n")) {
+            const end = /^```[ \t]*$/m.exec(body.slice(8));
+            if (!end)
+                break;
+            normalized = body.slice(8 + end.index + end[0].length).trimStart();
+        }
+        else {
+            const end = body.indexOf("\n\n");
+            normalized = end < 0 ? "" : body.slice(end + 2).trimStart();
+        }
+    }
     for (let i = 0; i < 6; i++) {
         const before = normalized;
         normalized = normalized.replace(AUTO_CAPTURE_SYSTEM_EVENT_LINE_RE, "\n");

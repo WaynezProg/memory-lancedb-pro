@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { readdir, stat } from "node:fs/promises";
+import { classifyWorkspaceMemoryPaths } from "./workspace-memory-provenance.js";
 import { parseCanonicalCorpusMetadata, } from "./corpus-indexer.js";
 const DEFAULT_FLUSH_SOFT_THRESHOLD_TOKENS = 4000;
 const DEFAULT_FLUSH_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
@@ -479,6 +480,7 @@ export function createOpenClawMemoryCapability(params) {
         promptBuilder: buildMemoryLancePromptSection,
         flushPlanResolver: buildMemoryLanceFlushPlan,
         runtime: {
+            classifyWorkspaceMemoryPaths,
             async getMemorySearchManager(runtimeParams) {
                 const manager = await createMemoryLanceSearchManager(params, runtimeParams.agentId ?? "main");
                 managers.add(manager);

@@ -1707,16 +1707,24 @@ export class MemoryStore {
         .limit(1)
         .toArray();
     } else {
-      // Prefix match: fetch candidates and filter in app layer
-      const all = await this.table!.query()
+      // Exact match first: full non-UUID hex ids (e.g. 64-char legacy) also match prefixRegex
+      const safeId = escapeSqlLiteral(id);
+      candidates = await this.table!.query()
         .select(["id", "scope"])
-        .limit(1000)
+        .where(`id = '${safeId}'`)
+        .limit(1)
         .toArray();
-      candidates = all.filter((r: any) => (r.id as string).startsWith(id));
-      if (candidates.length > 1) {
-        throw new Error(
-          `Ambiguous prefix "${id}" matches ${candidates.length} memories. Use a longer prefix or full ID.`,
-        );
+      if (candidates.length === 0) {
+        // Prefix match: scan ids without a row cap so results don't depend on storage order
+        const all = await this.table!.query()
+          .select(["id", "scope"])
+          .toArray();
+        candidates = all.filter((r: any) => (r.id as string).startsWith(id));
+        if (candidates.length > 1) {
+          throw new Error(
+            `Ambiguous prefix "${id}" matches ${candidates.length} memories. Use a longer prefix or full ID.`,
+          );
+        }
       }
     }
     if (candidates.length === 0) {
@@ -1908,25 +1916,28 @@ export class MemoryStore {
           .limit(1)
           .toArray();
       } else {
-        // Prefix match
-        const all = await this.table!.query()
-          .select([
-            "id",
-            "text",
-            "vector",
-            "category",
-            "scope",
-            "importance",
-            "timestamp",
-            "metadata",
-          ])
-          .limit(1000)
+        // Exact match first: full non-UUID hex ids (e.g. 64-char legacy) also match prefixRegex
+        rows = await this.table!.query()
+          .where(`id = '${escapeSqlLiteral(id)}'`)
+          .limit(1)
           .toArray();
-        rows = all.filter((r: any) => (r.id as string).startsWith(id));
-        if (rows.length > 1) {
-          throw new Error(
-            `Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`,
-          );
+        if (rows.length === 0) {
+          // Prefix match: scan ids only (no row cap), then load the single match
+          const all = await this.table!.query()
+            .select(["id"])
+            .toArray();
+          const matches = all.filter((r: any) => (r.id as string).startsWith(id));
+          if (matches.length > 1) {
+            throw new Error(
+              `Ambiguous prefix "${id}" matches ${matches.length} memories. Use a longer prefix or full ID.`,
+            );
+          }
+          if (matches.length === 1) {
+            rows = await this.table!.query()
+              .where(`id = '${escapeSqlLiteral(matches[0].id as string)}'`)
+              .limit(1)
+              .toArray();
+          }
         }
       }
 

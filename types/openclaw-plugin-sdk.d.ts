@@ -1,3 +1,9 @@
+declare module "openclaw/plugin-sdk/memory-core-host-runtime-core" {
+  export function readMemoryArtifactProvenance(params: { workspaceDir: string; relativePath: string }): Promise<{
+    originClass: "owner" | "agent" | "system" | "untrusted";
+  } | undefined>;
+}
+
 declare module "openclaw/plugin-sdk" {
   export interface OpenClawPluginApi {
     logger: {

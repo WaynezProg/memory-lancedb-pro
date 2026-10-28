@@ -25,8 +25,7 @@ function unwrapCodexCurrentRequest(prompt) {
     return prompt;
 }
 export function resolveAutoRecallQuery(prompt, rawUserMessage) {
-    if (rawUserMessage)
-        return rawUserMessage;
-    const cleanedPrompt = stripAutoCaptureInjectedPrefix("user", typeof prompt === "string" ? prompt : "");
+    const input = rawUserMessage || (typeof prompt === "string" ? prompt : "");
+    const cleanedPrompt = stripAutoCaptureInjectedPrefix("user", input);
     return stripAutoCaptureInjectedPrefix("user", unwrapCodexCurrentRequest(cleanedPrompt));
 }

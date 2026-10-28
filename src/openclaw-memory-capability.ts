@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { readdir, stat } from "node:fs/promises";
+import { classifyWorkspaceMemoryPaths } from "./workspace-memory-provenance.js";
 import {
   parseCanonicalCorpusMetadata,
   type CanonicalCorpusConfig,
@@ -671,6 +672,7 @@ export function createOpenClawMemoryCapability(params: MemoryCapabilityParams) {
     promptBuilder: buildMemoryLancePromptSection,
     flushPlanResolver: buildMemoryLanceFlushPlan,
     runtime: {
+      classifyWorkspaceMemoryPaths,
       async getMemorySearchManager(runtimeParams: { agentId?: string }) {
         const manager = await createMemoryLanceSearchManager(params, runtimeParams.agentId ?? "main");
         managers.add(manager);

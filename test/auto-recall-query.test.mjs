@@ -123,5 +123,21 @@ for (const [label, entry, dependencyRoot] of [
     it("does not replace the current prompt with an older user message", async () => {
       assert.deepEqual(await queriesFor(request, { messages: [{ role: "user", content: "old preference from another turn" }] }), [request, request]);
     });
+    it("strips 2026.9.3 marked inbound blocks before unwrapping LCM history", async () => {
+      const metadata = 'Conversation info: ⟦openclaw:ctx⟧\n```json\n{"message_id":"test"}\n```\n\n' +
+        'Chat window: ⟦openclaw:ctx⟧\nold chat message\n\n';
+      assert.deepEqual(await queriesFor(metadata + project("old context ".repeat(8000), request)), [request, request]);
+      assert.deepEqual(await queriesFor(metadata + project("history", "好")), []);
+    });
+    it("also cleans metadata and projections in cached ingress", async () => {
+      const raw = 'Conversation info: ⟦openclaw:ctx⟧\n```json\n{}\n```\n\n' + project("history", request);
+      assert.deepEqual(await queriesFor("unused prompt", { raw }), [request, request]);
+    });
+    it("preserves unmarked headings and marker text inside a user request", async () => {
+      for (const prompt of [
+        `Conversation info:\n\`\`\`json\n{}\n\`\`\`\n\n${request}`,
+        `${request}\nExample: ⟦openclaw:ctx⟧\n\`\`\`json\n{}\n\`\`\``,
+      ]) assert.deepEqual(await queriesFor(prompt), [prompt, prompt]);
+    });
   });
 }
