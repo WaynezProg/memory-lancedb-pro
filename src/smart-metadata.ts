@@ -1,5 +1,7 @@
 import {
+  MEMORY_CATEGORIES,
   TEMPORAL_VERSIONED_CATEGORIES,
+  normalizeCategory,
   type MemoryCategory,
   type MemoryTier,
 } from "./memory-categories.js";
@@ -44,6 +46,7 @@ export type MemorySource =
   | "manual"
   | "auto-capture"
   | "reflection"
+  | "dreaming-engine"
   | "session-summary"
   | "legacy";
 
@@ -167,6 +170,7 @@ function normalizeSource(value: unknown): MemorySource {
     case "manual":
     case "auto-capture":
     case "reflection":
+    case "dreaming-engine":
     case "session-summary":
     case "legacy":
       return value;
@@ -191,8 +195,21 @@ function deriveDefaultLayer(
   source: MemorySource,
   memoryCategory: MemoryCategory,
   state: MemoryState,
+  rowType?: unknown,
 ): MemoryLayer {
-  if (source === "reflection" || source === "session-summary") return "reflection";
+  // Writer-1 mapped rows carry source "reflection" as provenance only - they
+  // live in the general pool. Deriving layer "reflection" from their source
+  // would hide judge-admitted rows from every recall path (auto-recall
+  // governance and manual recall both exclude that layer). Slice rows
+  // (memory-reflection / memory-reflection-item) still derive "reflection"
+  // and stay recall-excluded by design.
+  const isGeneralPoolReflectionRow = rowType === "memory-reflection-mapped";
+  if (
+    !isGeneralPoolReflectionRow &&
+    (source === "reflection" || source === "dreaming-engine" || source === "session-summary")
+  ) {
+    return "reflection";
+  }
   if (state === "archived") return "archive";
   if (
     memoryCategory === "profile" ||
@@ -204,27 +221,56 @@ function deriveDefaultLayer(
   return "working";
 }
 
+function looksLikePersonalProfileText(text: string): boolean {
+  return (
+    /\b(my |i am |i'm |name is |叫我|我的|我是)\b/i.test(text) &&
+    text.length < 200
+  );
+}
+
 export function reverseMapLegacyCategory(
-  oldCategory: LegacyStoreCategory | undefined,
+  oldCategory: string | undefined,
   text = "",
+  rowType?: unknown,
 ): MemoryCategory {
+  // Rows written by builds that put the six-category vocabulary straight into
+  // the legacy-typed column read back as themselves instead of falling to the
+  // "patterns" default. This is a read-side tolerance for historical data;
+  // the write path and the --categories-only backfill keep the column in the
+  // legacy storage vocabulary.
+  if (
+    typeof oldCategory === "string" &&
+    (MEMORY_CATEGORIES as readonly string[]).includes(oldCategory)
+  ) {
+    return oldCategory as MemoryCategory;
+  }
   switch (oldCategory) {
     case "preference":
       return "preferences";
     case "entity":
       return "entities";
-    case "decision":
-      return "events";
     case "other":
       return "patterns";
     case "fact":
-      if (
-        /\b(my |i am |i'm |name is |叫我|我的|我是)\b/i.test(text) &&
-        text.length < 200
-      ) {
+      if (looksLikePersonalProfileText(text)) {
         return "profile";
       }
       return "cases";
+    case "decision":
+      // Reflection-mapped "Decisions (durable)" rows written before write-time
+      // stamping landed are durable operational facts, not one-off occurrences —
+      // read those through the same branch as "fact". The redirect is gated on
+      // the row's own mapped-row identity: an ordinary legacy "decision" row
+      // with no reflection provenance keeps the canonical decision→events
+      // mapping (LEGACY_TO_SMART_CATEGORY and the upgrader's reverseMapCategory
+      // both agree on "events").
+      if (rowType === "memory-reflection-mapped") {
+        if (looksLikePersonalProfileText(text)) {
+          return "profile";
+        }
+        return "cases";
+      }
+      return "events";
     default:
       return "patterns";
   }
@@ -347,7 +393,15 @@ export function parseSmartMetadata(
       ? entry.timestamp
       : Date.now();
 
-  const memoryCategory = reverseMapLegacyCategory(entry.category, text);
+  const memoryCategory = reverseMapLegacyCategory(entry.category, text, parsed.type);
+  // A row that carries a valid stamped memory_category is authoritative over
+  // the column-derived value for layer purposes: mapped rows written with the
+  // six-category vocabulary in the legacy column (pre-contract-fix builds)
+  // must derive the same default layer as an equivalent legacy-backed row.
+  const stampedMemoryCategory =
+    typeof parsed.memory_category === "string"
+      ? normalizeCategory(parsed.memory_category)
+      : null;
   const l0 = normalizeText(parsed.l0_abstract, text);
   const l2 = normalizeText(parsed.l2_content, text);
   const validFrom = normalizeTimestamp(parsed.valid_from, timestamp);
@@ -355,7 +409,9 @@ export function parseSmartMetadata(
   const fallbackSource =
     parsed.type === "session-summary"
       ? "session-summary"
-      : parsed.type === "memory-reflection" || parsed.type === "memory-reflection-item"
+      : parsed.type === "memory-reflection" ||
+          parsed.type === "memory-reflection-item" ||
+          parsed.type === "memory-reflection-mapped"
         ? "reflection"
         : "legacy";
   const source = normalizeSource(parsed.source ?? fallbackSource);
@@ -363,7 +419,8 @@ export function parseSmartMetadata(
     source === "session-summary" ? "archived" : "confirmed";
   const state = normalizeState(parsed.state ?? defaultState);
   const memoryLayer = normalizeLayer(
-    parsed.memory_layer ?? deriveDefaultLayer(source, memoryCategory, state),
+    parsed.memory_layer ??
+      deriveDefaultLayer(source, stampedMemoryCategory ?? memoryCategory, state, parsed.type),
   );
   const normalized: SmartMemoryMetadata = {
     ...parsed,

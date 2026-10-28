@@ -22,7 +22,7 @@ describe("mdMirror fallback directory", () => {
 
   it("uses the isolated state directory when no runtime override is present", () => {
     const dir = getDefaultMdMirrorDir();
-    const expected = "/Users/waynetu/openclaw2.0/state/memory/md-mirror";
+    const expected = path.join(process.env.OPENCLAW_STATE_DIR?.trim() || "/Users/waynetu/openclaw2.0/state", "memory", "md-mirror");
     assert.equal(dir, expected);
   });
 

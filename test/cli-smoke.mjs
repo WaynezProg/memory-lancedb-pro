@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import Module from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -17,17 +17,29 @@ Module._initPaths();
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 
 async function captureStdout(run) {
-  const chunks = [];
+  const stdoutChunks = [];
+  const logChunks = [];
   const originalLog = console.log;
+  const originalWrite = process.stdout.write;
   console.log = (...args) => {
-    chunks.push(args.join(" "));
+    logChunks.push(args.join(" "));
+  };
+  process.stdout.write = function write(chunk, encoding, callback) {
+    stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk.toString(encoding) : String(chunk));
+    if (typeof encoding === "function") {
+      encoding();
+    } else if (typeof callback === "function") {
+      callback();
+    }
+    return true;
   };
   try {
     await run();
   } finally {
+    process.stdout.write = originalWrite;
     console.log = originalLog;
   }
-  return chunks.join("\n");
+  return { stdout: stdoutChunks.join(""), logs: logChunks.join("\n") };
 }
 
 async function createSourceDb(sourceDbPath) {
@@ -176,6 +188,44 @@ async function runCliSmoke() {
   ]);
   assert.equal(process.exitCode, 1, "missing embedder must set a failing exit code");
   process.exitCode = previousExitCode;
+  const listOutput = await captureStdout(async () => {
+    await program.parseAsync([
+      "node",
+      "openclaw",
+      "memory-pro",
+      "list",
+      "--scope",
+      "agent:smoke",
+      "--json",
+    ]);
+  });
+
+  assert.equal(listOutput.logs, "", "memory-pro list --json should not use console.log");
+  assert.equal(JSON.parse(listOutput.stdout)[0].id, importId);
+
+  const vaultPath = path.join(workDir, "obsidian-vault");
+  const outObsidian = await captureLogs([
+    "node",
+    "openclaw",
+    "memory-pro",
+    "sync",
+    "obsidian",
+    "--vault",
+    vaultPath,
+    "--scope",
+    "agent:smoke",
+    "--limit",
+    "10",
+  ]);
+  assert.match(outObsidian, /Obsidian sync completed: 1 created, 0 updated, 0 skipped/, outObsidian);
+
+  const exportedDir = path.join(vaultPath, "00-AI-Memory", "05-Other");
+  const exportedFiles = readdirSync(exportedDir);
+  assert.equal(exportedFiles.length, 1);
+  const exportedMarkdown = readFileSync(path.join(exportedDir, exportedFiles[0]), "utf8");
+  assert.match(exportedMarkdown, /id: "smoke_import_id_1"/);
+  assert.match(exportedMarkdown, /category: "other"/);
+  assert.match(exportedMarkdown, new RegExp(importPhrase));
 
   const { parseAccessMetadata, buildUpdatedMetadata, computeEffectiveHalfLife } =
     jiti("../src/access-tracker.ts");
@@ -268,7 +318,9 @@ async function runCliSmoke() {
     ]);
   });
 
-  assert.match(searchOutput, /search_regression_1/);
+  assert.equal(searchOutput.logs, "", "memory-pro search --json should not use console.log");
+  assert.match(searchOutput.stdout, /search_regression_1/);
+  assert.equal(JSON.parse(searchOutput.stdout)[0].entry.id, "search_regression_1");
 
   const lexicalStore = new MemoryStore({
     dbPath: path.join(workDir, "lexical-db"),

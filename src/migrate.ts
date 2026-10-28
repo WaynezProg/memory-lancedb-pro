@@ -58,6 +58,16 @@ function normalizeLegacyVector(value: unknown): number[] {
 // Default Paths
 // ============================================================================
 
+/**
+ * A legacy row's own scope wins only when it is a real scope: whitespace-only
+ * values are invalid under the write validator and fall back to the migration
+ * default, mirroring importEntry's fail-closed contract.
+ */
+function resolveLegacyEntryScope(scope: string | undefined, defaultScope: string): string {
+  const trimmed = typeof scope === "string" ? scope.trim() : "";
+  return trimmed || defaultScope;
+}
+
 function getDefaultLegacyPaths(): string[] {
   const home = homedir();
   return [
@@ -169,6 +179,8 @@ export class MemoryMigrator {
         id: row.id as string,
         text: row.text as string,
         vector: normalizeLegacyVector(row.vector),
+        // Keep raw legacy importance; importEntry({ legacy: true }) normalizes
+        // it exactly once at the explicit legacy-provenance boundary.
         importance: Number(row.importance),
         category: (row.category as LegacyMemoryEntry["category"]) || "other",
         createdAt: Number(row.createdAt),
@@ -188,7 +200,9 @@ export class MemoryMigrator {
     let skipped = 0;
     const errors: string[] = [];
 
-    const defaultScope = options.defaultScope || "global";
+    // Whitespace-safe: importEntry now rejects blank scopes outright, so the
+    // fallback chain must never hand it one.
+    const defaultScope = (options.defaultScope ?? "").trim() || "global";
 
     for (const legacy of legacyEntries) {
       try {
@@ -200,7 +214,7 @@ export class MemoryMigrator {
           }
 
           const existing = await this.targetStore.vectorSearch(
-            legacy.vector, 1, 0.9, [legacy.scope || defaultScope]
+            legacy.vector, 1, 0.9, [resolveLegacyEntryScope(legacy.scope, defaultScope)]
           );
           if (existing.length > 0 && existing[0].score > 0.95) {
             skipped++;
@@ -209,12 +223,16 @@ export class MemoryMigrator {
         }
 
         // Convert legacy entry to new format while preserving legacy identity.
+        // Pass the raw legacy importance through to importEntry with
+        // { legacy: true } so normalization happens exactly once at this
+        // explicit legacy-provenance boundary (avoids repeated calls to a
+        // non-idempotent legacy normalizer on out-of-range/corrupt data).
         const newEntry: MemoryEntry = {
           id: legacy.id,
           text: legacy.text,
           vector: legacy.vector,
           category: legacy.category,
-          scope: legacy.scope || defaultScope,
+          scope: resolveLegacyEntryScope(legacy.scope, defaultScope),
           importance: legacy.importance,
           timestamp: Number.isFinite(legacy.createdAt) ? legacy.createdAt : Date.now(),
           metadata: JSON.stringify({
@@ -224,7 +242,7 @@ export class MemoryMigrator {
           }),
         };
 
-        await this.targetStore.importEntry(newEntry);
+        await this.targetStore.importEntry(newEntry, { legacy: true });
         migrated++;
 
         if (migrated % 100 === 0) {

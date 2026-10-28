@@ -19,6 +19,7 @@
  *        - metadata:   marked { compacted: true, sourceCount: N }
  *   4. Delete source entries, store merged entry.
  */
+import { buildSmartMetadata, parseSmartMetadata, reverseMapLegacyCategory, stringifySmartMetadata, } from "./smart-metadata.js";
 // ============================================================================
 // Math helpers
 // ============================================================================
@@ -115,7 +116,7 @@ export function buildMergedEntry(members) {
     const seen = new Set();
     const lines = [];
     for (const m of members) {
-        for (const line of m.text.split("\n")) {
+        for (const line of getFullSearchableContent(m).split("\n")) {
             const trimmed = line.trim();
             if (trimmed && !seen.has(trimmed.toLowerCase())) {
                 seen.add(trimmed.toLowerCase());
@@ -142,12 +143,96 @@ export function buildMergedEntry(members) {
     // --- scope: use the first (all should match) ---
     const scope = members[0].scope;
     // --- metadata ---
-    const metadata = JSON.stringify({
+    const compactedAt = Date.now();
+    const metadata = stringifySmartMetadata(buildSmartMetadata({
+        text,
+        category,
+        importance,
+        timestamp: compactedAt,
+        metadata: "{}",
+    }, {
+        l0_abstract: buildCompactedAbstract(members, text),
+        l1_overview: buildCompactedOverview(members, text),
+        l2_content: text,
+        memory_category: reverseMapLegacyCategory(category, text),
+        tier: strongestTier(members),
+        access_count: maxAccessCount(members),
+        confidence: maxConfidence(members),
+        last_accessed_at: Math.max(...members.map((m) => m.timestamp), compactedAt),
         compacted: true,
         sourceCount: members.length,
-        compactedAt: Date.now(),
-    });
+        compactedAt,
+    }));
     return { text, importance, category, scope, metadata };
+}
+function metadataFor(entry) {
+    return parseSmartMetadata(entry.metadata, entry);
+}
+function getFullSearchableContent(entry) {
+    return metadataFor(entry).l2_content || entry.text;
+}
+function stripBulletPrefix(text) {
+    return text.replace(/^\s*[-*]\s+/, "").trim();
+}
+function dedupeNonEmpty(values) {
+    const seen = new Set();
+    const deduped = [];
+    for (const value of values) {
+        const trimmed = stripBulletPrefix(value);
+        if (!trimmed)
+            continue;
+        const key = trimmed.toLowerCase();
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        deduped.push(trimmed);
+    }
+    return deduped;
+}
+function buildCompactedAbstract(members, fallbackText) {
+    const highestImportance = [...members].sort((a, b) => b.importance - a.importance)[0];
+    const candidate = highestImportance ? metadataFor(highestImportance).l0_abstract : "";
+    const fallback = fallbackText.match(/^[^.!?。！？\n]+[.!?。！？]?/)?.[0] || fallbackText;
+    return (candidate || fallback).slice(0, 180).trim();
+}
+function buildCompactedOverview(members, fallbackText) {
+    const summaries = dedupeNonEmpty(members.map((member) => metadataFor(member).l0_abstract)).slice(0, 8);
+    if (summaries.length > 0) {
+        return summaries.map((summary) => `- ${summary}`).join("\n");
+    }
+    return `- ${buildCompactedAbstract(members, fallbackText)}`;
+}
+function strongestTier(members) {
+    const rank = {
+        peripheral: 0,
+        working: 1,
+        core: 2,
+    };
+    return members
+        .map((member) => metadataFor(member).tier)
+        .sort((a, b) => rank[b] - rank[a])[0] ?? "working";
+}
+function maxAccessCount(members) {
+    return Math.max(0, ...members.map((member) => metadataFor(member).access_count));
+}
+function maxConfidence(members) {
+    return Math.max(0.7, ...members.map((member) => metadataFor(member).confidence));
+}
+const MAX_CLUSTER_COMPACTION_CONCURRENCY = 3;
+const MAX_CLUSTER_DELETE_CONCURRENCY = 8;
+async function mapWithConcurrency(items, concurrency, mapper) {
+    if (items.length === 0)
+        return [];
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(Math.max(1, concurrency), items.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (nextIndex < items.length) {
+            const currentIndex = nextIndex++;
+            results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+        }
+    }));
+    return results;
 }
 // ============================================================================
 // Main runner
@@ -186,9 +271,7 @@ export async function runCompaction(store, embedder, config, scopes, logger) {
             dryRun: true,
         };
     }
-    let memoriesDeleted = 0;
-    let memoriesCreated = 0;
-    for (const plan of plans) {
+    const outcomes = await mapWithConcurrency(plans, MAX_CLUSTER_COMPACTION_CONCURRENCY, async (plan) => {
         const members = plan.memberIndices.map((i) => valid[i]);
         try {
             // Embed the merged text
@@ -202,18 +285,28 @@ export async function runCompaction(store, embedder, config, scopes, logger) {
                 scope: plan.merged.scope,
                 metadata: plan.merged.metadata,
             });
-            memoriesCreated++;
             // Delete source entries
-            for (const m of members) {
-                const deleted = await store.delete(m.id);
-                if (deleted)
-                    memoriesDeleted++;
-            }
+            const deleteResults = await mapWithConcurrency(members, MAX_CLUSTER_DELETE_CONCURRENCY, async (m) => {
+                try {
+                    return (await store.delete(m.id)) ? 1 : 0;
+                }
+                catch (err) {
+                    logger?.warn(`memory-compactor: failed to delete source memory ${m.id}: ${String(err)}`);
+                    return 0;
+                }
+            });
+            return {
+                memoriesDeleted: deleteResults.reduce((sum, deleted) => sum + deleted, 0),
+                memoriesCreated: 1,
+            };
         }
         catch (err) {
             logger?.warn(`memory-compactor: failed to merge cluster of ${members.length}: ${String(err)}`);
+            return { memoriesDeleted: 0, memoriesCreated: 0 };
         }
-    }
+    });
+    const memoriesDeleted = outcomes.reduce((sum, outcome) => sum + outcome.memoriesDeleted, 0);
+    const memoriesCreated = outcomes.reduce((sum, outcome) => sum + outcome.memoriesCreated, 0);
     logger?.info(`memory-compactor: scanned=${valid.length} clusters=${plans.length} ` +
         `deleted=${memoriesDeleted} created=${memoriesCreated}`);
     return {

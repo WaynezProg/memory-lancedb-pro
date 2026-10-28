@@ -105,6 +105,18 @@ async function setupWorkspace(name) {
   return wsDir;
 }
 
+async function captureConsoleLogs(run) {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => logs.push(args.join(" "));
+  try {
+    const result = await run();
+    return { result, output: logs.join("\n") };
+  } finally {
+    console.log = originalLog;
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────────────── Setup / Teardown ──────────────────────────────────────────────────────────────────────────────
 
 before(async () => {
@@ -212,6 +224,66 @@ describe("import-markdown CLI", () => {
     });
   });
 
+  describe("process logging", () => {
+    it("prints default process logs and detailed summary counters", async () => {
+      const wsDir = await setupWorkspace("logging-summary-test");
+      await writeFile(
+        join(wsDir, "MEMORY.md"),
+        "- no\n- Duplicate log entry\n- Fresh visible import entry\n",
+        "utf-8",
+      );
+
+      mockStore.storedRecords.push({
+        text: "Duplicate log entry",
+        scope: "logging-summary-test",
+        category: "other",
+        importance: 0.7,
+        vector: [0.1],
+        metadata: "{}",
+      });
+
+      const { result, output } = await captureConsoleLogs(() =>
+        runImportMarkdown(
+          { embedder: mockEmbedder, store: mockStore },
+          {
+            openclawHome: testWorkspaceDir,
+            workspaceGlob: "logging-summary-test",
+            dedup: true,
+          },
+        ),
+      );
+
+      assert.strictEqual(result.foundFiles, 1);
+      assert.strictEqual(result.entriesProcessed, 3);
+      assert.strictEqual(result.imported, 1);
+      assert.strictEqual(result.skipped, 2);
+      assert.strictEqual(result.skippedShort, 1);
+      assert.strictEqual(result.skippedDedup, 1);
+      assert.strictEqual(result.errorCount, 0);
+      assert.strictEqual(result.embedBatches, 1);
+      assert.strictEqual(result.bulkStoreCalls, 1);
+
+      assert.match(output, /\[scan\] found 1 markdown file\(s\) across 1 workspace\(s\):/);
+      assert.match(output, /\[scan\] \[logging-summary-test\].*MEMORY\.md/);
+      assert.match(output, /\[scan\] reading: .*MEMORY\.md/);
+      assert.match(output, /\[import\] dedup check: enabled/);
+      assert.match(output, /\[skip\] too short \[logging-summary-test\]: no/);
+      assert.match(output, /\[skip\] dedup \[logging-summary-test\]: Duplicate log entry/);
+      assert.match(output, /\[import\] embedded batch 1 \(1 entries\)/);
+      assert.match(output, /\[import\] stored batch 1 \(1\/1 entries, total: 1\)/);
+      assert.match(output, /Memory Import Status:/);
+      assert.match(output, /• Files found: 1/);
+      assert.match(output, /• Entries processed: 3/);
+      assert.match(output, /• Imported: 1/);
+      assert.match(output, /• Skipped \(too short\): 1/);
+      assert.match(output, /• Skipped \(dedup\): 1/);
+      assert.match(output, /• Errors: 0/);
+      assert.match(output, /• Embed batches: 1/);
+      assert.match(output, /• bulkStore calls: 1/);
+      assert.match(output, /• Elapsed: \d+ms/);
+    });
+  });
+
   describe("dedup logic", () => {
     it("skips already-imported entries in same scope when dedup is enabled", async () => {
       const wsDir = await setupWorkspace("dedup-test");
@@ -264,6 +336,48 @@ describe("import-markdown CLI", () => {
 
       assert.strictEqual(imported, 1);
       assert.strictEqual(mockStore.storedRecords.length, 2); // Two entries, different scopes
+    });
+
+    it("skips an exact duplicate even when BM25 ranks it below a similar result", async () => {
+      const wsDir = await setupWorkspace("dedup-rank-test");
+      await writeFile(join(wsDir, "MEMORY.md"), "- Exact duplicate memory\n", "utf-8");
+
+      const rankedStore = {
+        ...mockStore,
+        async bm25Search(query, limit = 1, scopeFilter = []) {
+          assert.strictEqual(query, "Exact duplicate memory");
+          assert.deepStrictEqual(scopeFilter, ["dedup-rank-test"]);
+          return [
+            {
+              entry: {
+                text: "Similar but not exact duplicate memory",
+                scope: "dedup-rank-test",
+              },
+              score: 1.0,
+            },
+            {
+              entry: {
+                text: "Exact duplicate memory",
+                scope: "dedup-rank-test",
+              },
+              score: 0.95,
+            },
+          ].slice(0, limit);
+        },
+      };
+
+      const { imported, skipped } = await runImportMarkdown(
+        { embedder: mockEmbedder, store: rankedStore },
+        {
+          openclawHome: testWorkspaceDir,
+          workspaceGlob: "dedup-rank-test",
+          dedup: true,
+        },
+      );
+
+      assert.strictEqual(imported, 0);
+      assert.strictEqual(skipped, 1);
+      assert.strictEqual(mockStore.storedRecords.length, 0);
     });
 
     it("batch imports mixed valid, short, duplicate, and cross-scope bullets", async () => {

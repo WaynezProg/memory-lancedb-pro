@@ -19,38 +19,43 @@ import {
   buildSmartMetadata,
   deriveFactKey,
   isMemoryVisibleInMode,
+  isMemoryActiveAt,
+  isMemoryExpired,
   parseSmartMetadata,
   stringifySmartMetadata,
   type MemoryRecallMode,
 } from "./smart-metadata.js";
 import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
-import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
+import {
+  matchesMemoryCategoryFilter,
+  resolveToolMemoryCategory,
+  TEMPORAL_VERSIONED_CATEGORIES,
+  TOOL_MEMORY_CATEGORIES,
+  type MemoryCategory,
+} from "./memory-categories.js";
 import {
   appendSelfImprovementEntry,
   countSelfImprovementEntries,
   DEFAULT_SELF_IMPROVEMENT_MAX_ENTRIES,
   ensureSelfImprovementLearningFiles,
 } from "./self-improvement-files.js";
-import { getDisplayCategoryTag } from "./reflection-metadata.js";
+import { getDisplayCategoryTag, parseReflectionMetadata } from "./reflection-metadata.js";
 import type { RetrievalTrace } from "./retrieval-trace.js";
 import {
   filterUserMdExclusiveRecallResults,
   isUserMdExclusiveMemory,
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
+import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
+import type { ManualEchoLedger } from "./manual-echo-guard.js";
+import { enqueueManualRecallMetadata } from "./manual-recall-metadata-queue.js";
+import { recordSurfacedRecall, type RecallInvocation, type SurfacedRecall } from "./native-recall.js";
 
 // ============================================================================
 // Types
 // ============================================================================
 
-export const MEMORY_CATEGORIES = [
-  "preference",
-  "fact",
-  "decision",
-  "entity",
-  "reflection",
-  "other",
-] as const;
+export const MEMORY_CATEGORIES = TOOL_MEMORY_CATEGORIES;
 
 function stringEnum<T extends readonly [string, ...string[]]>(values: T) {
   return Type.Unsafe<T[number]>({
@@ -73,6 +78,16 @@ interface ToolContext {
   mdMirror?: MdMirrorWriter | null;
   workspaceBoundary?: WorkspaceBoundaryConfig;
   selfImprovementMaxEntries?: number;
+  // Manual-priority store lane: a memory_store that finds a similar existing
+  // row supersedes it instead of being rejected as a duplicate; the manual
+  // text always lands verbatim.
+  manualStoreSupersede?: boolean;
+  // Echo guard: manual store/update texts are recorded here so
+  // auto-capture extraction can drop near-identical echo candidates.
+  manualEchoLedger?: ManualEchoLedger;
+  // Mirrors MemoryCliContext's onMemoriesDeleted (cli.ts): lets the host invalidate
+  // in-process reflection caches after a live delete, not just CLI delete/delete-bulk.
+  onMemoriesDeleted?: (info: { scopeFilter?: string[] }) => void;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -105,14 +120,17 @@ function truncateText(text: string, maxChars: number): string {
   return `${clipped}…`;
 }
 
-function deriveManualMemoryLayer(category: string): "durable" | "working" {
-  if (category === "preference" || category === "decision" || category === "fact") {
+function deriveManualMemoryLayer(category: MemoryCategory): "durable" | "working" {
+  if (category === "profile" || category === "preferences" || category === "events") {
     return "durable";
   }
   return "working";
 }
 
-function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
+function sanitizeMemoryForSerialization(
+  results: RetrievalResult[],
+  options: { includeNeighbors?: boolean } = {},
+) {
   return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
@@ -122,7 +140,308 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     importance: r.entry.importance,
     score: r.score,
     sources: r.sources,
+    ...(options.includeNeighbors && r.neighbors && r.neighbors.length > 0
+      ? {
+        neighbors: r.neighbors.map((neighbor) => ({
+          id: neighbor.entry.id,
+          text: neighbor.entry.text,
+          category: getDisplayCategoryTag(neighbor.entry),
+          rawCategory: neighbor.entry.category,
+          scope: neighbor.entry.scope,
+          importance: neighbor.entry.importance,
+          score: neighbor.score,
+          sources: neighbor.sources,
+        })),
+      }
+      : {}),
   }));
+}
+
+function isManualRecallNeighborGovernanceEligible(
+  result: RetrievalResult,
+  nowMs: number,
+): boolean {
+  const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+  if (meta.state !== "confirmed") return false;
+  if (meta.memory_layer === "archive" || meta.memory_layer === "reflection") return false;
+  if (isTier1Suppressed(meta, nowMs)) return false;
+  return true;
+}
+
+function filterManualRecallResultNeighbors(
+  results: RetrievalResult[],
+  workspaceBoundary?: WorkspaceBoundaryConfig,
+  nowMs = Date.now(),
+): RetrievalResult[] {
+  return results.map((result) => {
+    if (!result.neighbors || result.neighbors.length === 0) return result;
+
+    const neighbors = filterUserMdExclusiveRecallResults(
+      result.neighbors.filter((neighbor) => isManualRecallNeighborGovernanceEligible(neighbor, nowMs)),
+      workspaceBoundary,
+    );
+    if (neighbors.length === result.neighbors.length) return result;
+    if (neighbors.length > 0) return { ...result, neighbors };
+
+    const { neighbors: _neighbors, ...withoutNeighbors } = result;
+    return withoutNeighbors;
+  });
+}
+
+function isUnresolvedReflectionItem(entry: MemoryEntry): boolean {
+  const metadata = parseReflectionMetadata(entry.metadata);
+  return metadata.type === "memory-reflection-item" && metadata.resolvedAt === undefined;
+}
+
+function formatReflectionResolveCandidate(result: {
+  entry: MemoryEntry;
+  score?: number;
+}): Record<string, unknown> {
+  const metadata = parseReflectionMetadata(result.entry.metadata);
+  return {
+    id: result.entry.id,
+    text: truncateText(normalizeInlineText(result.entry.text), 220),
+    itemKind: metadata.itemKind,
+    agentId: metadata.agentId,
+    score: result.score,
+  };
+}
+
+function formatReflectionResolvePreview(candidates: Array<{ entry: MemoryEntry; score?: number }>): string {
+  const lines = candidates.map((candidate, idx) => {
+    const metadata = parseReflectionMetadata(candidate.entry.metadata);
+    const itemKind = typeof metadata.itemKind === "string" ? metadata.itemKind : "item";
+    const scoreText = typeof candidate.score === "number" ? ` score=${candidate.score.toFixed(3)}` : "";
+    return `${idx + 1}. [${candidate.entry.id}] ${itemKind}${scoreText}: ${truncateText(normalizeInlineText(candidate.entry.text), 180)}`;
+  });
+  return [
+    `Reflection resolve preview: ${candidates.length} candidate(s). No changes made.`,
+    ...lines,
+  ].join("\n");
+}
+
+function parseFactQueryTimestamp(value: unknown): number {
+  if (typeof value !== "string" || value.trim().length === 0) return Date.now();
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid at timestamp: ${value}`);
+  }
+  return parsed;
+}
+
+function formatFactTimestamp(value: number | undefined): string | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? new Date(value).toISOString()
+    : undefined;
+}
+
+function parseMetadataObject(rawMetadata: string | undefined): Record<string, unknown> {
+  if (!rawMetadata) return {};
+  try {
+    const parsed = JSON.parse(rawMetadata);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function hasExplicitMetadataField(entry: MemoryEntry, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(parseMetadataObject(entry.metadata), field);
+}
+
+/**
+ * The one normalization rule for comparing fact keys: explicit keys are stored
+ * trimmed but case-preserved while derived keys are lowercased, so every
+ * comparison site must apply the same trim+lowercase rule or a mixed-case
+ * explicit key ("Preferences:Theme") diverges from its query-equivalent
+ * derived form ("preferences:theme").
+ */
+function normalizeFactKeyForComparison(key: string | undefined): string | undefined {
+  const normalized = key?.trim().toLowerCase();
+  return normalized ? normalized : undefined;
+}
+
+function factQueryMatches(entry: MemoryEntry, query: string | undefined, factKey: string | undefined): boolean {
+  const meta = parseSmartMetadata(entry.metadata, entry);
+  const normalizedFactKey = normalizeFactKeyForComparison(factKey);
+  if (normalizedFactKey && normalizeFactKeyForComparison(meta.fact_key) !== normalizedFactKey) return false;
+
+  const normalizedQuery = query?.trim().toLowerCase();
+  if (!normalizedQuery) return true;
+
+  return [
+    meta.fact_key,
+    meta.memory_category,
+    meta.l0_abstract,
+    meta.l1_overview,
+    entry.text,
+  ].some((value) => typeof value === "string" && value.toLowerCase().includes(normalizedQuery));
+}
+
+function isTemporalFactEntry(entry: MemoryEntry, hasFactKeySelector: boolean): boolean {
+  const rawMetadata = parseMetadataObject(entry.metadata);
+  if (hasFactKeySelector) return true;
+
+  return Boolean(
+    hasExplicitMetadataField(entry, "supersedes") ||
+    hasExplicitMetadataField(entry, "superseded_by") ||
+    hasExplicitMetadataField(entry, "invalidated_at") ||
+    hasExplicitMetadataField(entry, "valid_until") ||
+    rawMetadata.memory_temporal_type === "dynamic",
+  );
+}
+
+function serializeFactEntry(entry: MemoryEntry, atMs: number) {
+  const meta = parseSmartMetadata(entry.metadata, entry);
+  const activeAt = isMemoryActiveAt(meta, atMs) && !isMemoryExpired(meta, atMs);
+  return {
+    id: entry.id,
+    text: entry.text,
+    scope: entry.scope,
+    category: entry.category,
+    memoryCategory: meta.memory_category,
+    factKey: meta.fact_key,
+    activeAt,
+    validFrom: formatFactTimestamp(meta.valid_from),
+    validUntil: formatFactTimestamp(meta.valid_until),
+    invalidatedAt: formatFactTimestamp(meta.invalidated_at),
+    supersedes: meta.supersedes,
+    supersededBy: meta.superseded_by,
+  };
+}
+
+const FACT_QUERY_PAGE_SIZE = 500;
+
+/**
+ * Hard ceiling on candidate rows a fact-key collision scan will accept from
+ * the store's bounded candidate query (see
+ * MemoryStore.listFactKeyCandidates). The scan runs inside
+ * storeSuperseding()'s cross-process write lock, so its work must stay
+ * bounded; a candidate set past this ceiling cannot guarantee a complete
+ * collision set, and an opted-in supersede write is REJECTED explicitly
+ * (FactKeyScanOverBoundError) rather than silently leaving the old same-key
+ * value active alongside the new one.
+ */
+const FACT_KEY_SCAN_MAX_ROWS = 20_000;
+
+/**
+ * An opted-in manual supersede write was rejected because the fact-key
+ * collision scan could not be completed within its bound. Callers surface
+ * this to the agent explicitly; `force: true` stores without superseding.
+ */
+export class FactKeyScanOverBoundError extends Error {
+  constructor(bound: number) {
+    super(
+      `manual supersede rejected: the scope holds more than ${bound} fact-key candidate rows, so a complete collision scan cannot be guaranteed. Retry with force: true to store without superseding, or reduce the scope's row count.`,
+    );
+    this.name = "FactKeyScanOverBoundError";
+  }
+}
+
+/**
+ * Complete, scope-aware lookup of ACTIVE rows holding a fact key. The vector
+ * top-K is the wrong tool for key collisions: a same-key row ranked behind
+ * closer unrelated neighbors, or below the similarity floor, is exactly the
+ * stale value a manual update must supersede. The store performs a bounded,
+ * scope-only candidate query (hard limit push-down, no sort, no content
+ * narrowing: effective keys hide in any valid JSON layout or derive from the
+ * storage category column, so a serialization-layout pattern can exclude a
+ * valid candidate); exact normalized-key and active-row filtering happen
+ * here. An over-bound candidate set throws FactKeyScanOverBoundError —
+ * never a silently incomplete collision set.
+ */
+async function findActiveFactKeyEntries(
+  store: MemoryStore,
+  scopeFilter: string[],
+  factKey: string,
+): Promise<MemoryEntry[]> {
+  const matches: MemoryEntry[] = [];
+  const targetKey = normalizeFactKeyForComparison(factKey);
+  if (!targetKey) return matches;
+  const now = Date.now();
+  const rows = await store.listFactKeyCandidates(
+    scopeFilter,
+    FACT_KEY_SCAN_MAX_ROWS,
+  );
+  if (rows.length > FACT_KEY_SCAN_MAX_ROWS) {
+    throw new FactKeyScanOverBoundError(FACT_KEY_SCAN_MAX_ROWS);
+  }
+  for (const entry of rows) {
+    // Exact scope match: store reads mask legacy NULL scopes as "global" and
+    // store-level filters have passed legacy rows through before; a
+    // supersede scan must never treat a row outside the requested scopes
+    // as a collision target.
+    if (!scopeFilter.includes(entry.scope)) continue;
+    const meta = parseSmartMetadata(entry.metadata, entry);
+    if (!isMemoryActiveAt(meta, now) || isMemoryExpired(meta, now)) continue;
+    const entryKey = normalizeFactKeyForComparison(
+      meta.fact_key ?? deriveFactKey(meta.memory_category, entry.text),
+    );
+    if (entryKey === targetKey) matches.push(entry);
+  }
+  return matches;
+}
+
+type FactQueryCandidate = {
+  entry: MemoryEntry;
+  meta: ReturnType<typeof parseSmartMetadata>;
+  fact: ReturnType<typeof serializeFactEntry>;
+};
+
+function compareFactQueryCandidates(a: FactQueryCandidate, b: FactQueryCandidate): number {
+  if (a.fact.activeAt !== b.fact.activeAt) return a.fact.activeAt ? -1 : 1;
+  return (b.meta.valid_from || 0) - (a.meta.valid_from || 0)
+    || (b.entry.timestamp || 0) - (a.entry.timestamp || 0);
+}
+
+async function collectFactQueryMatches(
+  store: MemoryStore,
+  scopeFilter: string[] | undefined,
+  query: string | undefined,
+  factKey: string | undefined,
+  atMs: number,
+  includeHistory: boolean,
+  limit: number,
+  workspaceBoundary?: WorkspaceBoundaryConfig | null,
+): Promise<FactQueryCandidate[]> {
+  const matches: FactQueryCandidate[] = [];
+  const seenIds = new Set<string>();
+  const hasFactKeySelector = Boolean(factKey?.trim());
+
+  for (let offset = 0; ; offset += FACT_QUERY_PAGE_SIZE) {
+    // excludeInactive:false -- this walk implements includeHistory itself
+    // (superseded/expired facts are the history), so the store must hand it
+    // inactive rows; the live-only default would silently break history.
+    const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset, { excludeInactive: false });
+    if (page.length === 0) break;
+
+    let newRows = 0;
+    const pageMatches: FactQueryCandidate[] = [];
+    for (const entry of page) {
+      if (seenIds.has(entry.id)) continue;
+      seenIds.add(entry.id);
+      newRows += 1;
+      if (isTemporalFactEntry(entry, hasFactKeySelector) && factQueryMatches(entry, query, factKey)) {
+        const meta = parseSmartMetadata(entry.metadata, entry);
+        const fact = serializeFactEntry(entry, atMs);
+        if (meta.valid_from <= atMs && (includeHistory || fact.activeAt)) {
+          pageMatches.push({ entry, meta, fact });
+        }
+      }
+    }
+
+    matches.push(...filterUserMdExclusiveRecallResults(pageMatches, workspaceBoundary));
+    matches.sort(compareFactQueryCandidates);
+    if (matches.length > limit) {
+      matches.length = limit;
+    }
+
+    if (page.length < FACT_QUERY_PAGE_SIZE || newRows === 0) break;
+  }
+
+  return matches;
 }
 
 const _warnedMissingAgentId = new Set<string>();
@@ -200,15 +519,53 @@ async function retrieveWithRetry(
   return results;
 }
 
-async function resolveMemoryId(
+function resolveReadableToolScopeFilter(
+  scopeManager: MemoryScopeManager,
+  agentId: string | undefined,
+  scope?: string,
+): {
+  scopeFilter: string[] | undefined;
+  ignoredScope?: string;
+  accessibleScopes?: string[];
+} {
+  if (scope) {
+    if (scopeManager.isAccessible(scope, agentId)) {
+      return { scopeFilter: [scope] };
+    }
+    const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+    return {
+      scopeFilter: resolveScopeFilter(scopeManager, agentId),
+      ignoredScope: scope,
+      accessibleScopes,
+    };
+  }
+
+  return { scopeFilter: resolveScopeFilter(scopeManager, agentId) };
+}
+
+function formatIgnoredScopeNotice(resolvedScopes: {
+  ignoredScope?: string;
+  accessibleScopes?: string[];
+}): string | undefined {
+  if (!resolvedScopes.ignoredScope) return undefined;
+  const scopes = resolvedScopes.accessibleScopes?.length
+    ? resolvedScopes.accessibleScopes.join(", ")
+    : "(none)";
+  return `Ignored inaccessible scope "${resolvedScopes.ignoredScope}" and searched accessible scopes instead: ${scopes}.`;
+}
+
+export async function resolveMemoryId(
   context: ToolContext,
   memoryRef: string,
   scopeFilter: string[],
+  options?: { requireExactRef?: boolean },
 ): Promise<
   | { ok: true; id: string }
   | { ok: false; message: string; details?: Record<string, unknown> }
 > {
-  const trimmed = memoryRef.trim();
+  // Agents copy ids out of injected context, which truncates them and often
+  // appends an ellipsis ("407dec9c..."); strip that before classifying.
+  const trimmed = memoryRef.trim().replace(/[.…]+$/u, "");
   if (!trimmed) {
     return {
       ok: false,
@@ -217,9 +574,59 @@ async function resolveMemoryId(
     };
   }
 
-  const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(trimmed);
-  if (uuidLike) {
+  const isFullUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+  if (isFullUuid) {
     return { ok: true, id: trimmed };
+  }
+
+  // Documented contract: "full UUID or 8+ char prefix". A hex-shaped ref
+  // that is not a complete UUID resolves as an id prefix within accessible
+  // scopes — unique match wins, multiple matches list candidates, and zero
+  // matches is an honest not-found (never a scan-match or a semantic guess).
+  const isIdPrefix = /^[0-9a-f][0-9a-f-]{7,35}$/i.test(trimmed);
+  if (isIdPrefix) {
+    const matches = await context.store.findByIdPrefix(trimmed, scopeFilter);
+    if (matches.length === 1) {
+      return { ok: true, id: matches[0].id };
+    }
+    if (matches.length > 1) {
+      const list = matches
+        .map(
+          (entry) =>
+            `- [${entry.id.slice(0, 8)}] ${entry.text.slice(0, 60)}${entry.text.length > 60 ? "..." : ""}`,
+        )
+        .join("\n");
+      return {
+        ok: false,
+        message: `Id prefix "${trimmed}" matches multiple memories. Use a longer prefix or the full id:\n${list}`,
+        details: { error: "ambiguous_id_prefix", prefix: trimmed },
+      };
+    }
+    return {
+      ok: false,
+      message: `Memory ${trimmed} not found or access denied.`,
+      details: { error: "not_found", id: trimmed },
+    };
+  }
+
+  // Supported legacy ids (older memory-lancedb-pro versions) pass through
+  // untouched: MemoryStore.delete/getById carry exact handling for this shape,
+  // and routing them into semantic retrieval let a sole low-score result
+  // resolve to an unrelated row.
+  if (/^mem-md-\d+$/i.test(trimmed)) {
+    return { ok: true, id: trimmed };
+  }
+
+  // Destructive callers pass a DIRECT id reference; anything that is not a
+  // full UUID, a validated prefix, or a supported legacy id is malformed for
+  // them, never a semantic query. Semantic resolution stays reserved for the
+  // query flow with its confidence and confirmation safeguards.
+  if (options?.requireExactRef) {
+    return {
+      ok: false,
+      message: `"${trimmed}" is not a memory id. Pass a full UUID, an 8+ character id prefix, or search by content via the query flow.`,
+      details: { error: "invalid_memory_ref", ref: trimmed },
+    };
   }
 
   const results = await retrieveWithRetry(context.retriever, {
@@ -545,54 +952,52 @@ export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, contex
 // Core Tools (Backward Compatible)
 // ============================================================================
 
-export function registerMemoryRecallTool(
-  api: OpenClawPluginApi,
-  context: ToolContext,
+const MEMORY_RECALL_PARAMETERS = Type.Object({
+  query: Type.String({
+    description: "Search query for finding relevant memories",
+  }),
+  limit: Type.Optional(
+    Type.Number({
+      description: "Max results to return (default: 3, max: 20; summary mode soft max: 6)",
+    }),
+  ),
+  includeFullText: Type.Optional(
+    Type.Boolean({
+      description: "Return full memory text when true (default: false returns summary previews)",
+    }),
+  ),
+  maxCharsPerItem: Type.Optional(
+    Type.Number({
+      description: "Maximum characters per returned memory in summary mode (default: 180)",
+    }),
+  ),
+  scope: Type.Optional(
+    Type.String({
+      description: "Specific memory scope to search in (optional)",
+    }),
+  ),
+  category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+  mode: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("history"), Type.Literal("review")], {
+    description: "Lifecycle view: active (default), history, or review.",
+  })),
+});
+
+function createMemoryRecallTool(
+  runtimeContext: ToolContext,
+  options: {
+    name: string;
+    label: string;
+    description: string;
+    api: OpenClawPluginApi;
+    invocation: RecallInvocation;
+  },
 ) {
-  api.registerTool(
-    (toolCtx) => {
-      const runtimeContext = resolveToolContext(context, toolCtx);
-      return {
-      name: "memory_recall",
-      label: "Memory Recall",
-      description:
-        "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
-      parameters: Type.Object({
-        query: Type.String({
-          description: "Search query for finding relevant memories",
-        }),
-        limit: Type.Optional(
-          Type.Number({
-            description: "Max results to return (default: 3, max: 20; summary mode soft max: 6)",
-          }),
-        ),
-        includeFullText: Type.Optional(
-          Type.Boolean({
-            description: "Return full memory text when true (default: false returns summary previews)",
-          }),
-        ),
-        maxCharsPerItem: Type.Optional(
-          Type.Number({
-            description: "Maximum characters per returned memory in summary mode (default: 180)",
-          }),
-        ),
-        scope: Type.Optional(
-          Type.String({
-            description: "Specific memory scope to search in (optional)",
-          }),
-        ),
-        category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-        mode: Type.Optional(
-          Type.Union([
-            Type.Literal("active"),
-            Type.Literal("history"),
-            Type.Literal("review"),
-          ], {
-            description: "Lifecycle view: active (default), history, or review.",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
+  return {
+    name: options.name,
+    label: options.label,
+    description: options.description,
+    parameters: MEMORY_RECALL_PARAMETERS,
+    async execute(_toolCallId: unknown, params: unknown) {
         const {
           query,
           limit = 3,
@@ -618,73 +1023,61 @@ export function registerMemoryRecallTool(
           const safeCharsPerItem = clampInt(maxCharsPerItem, 60, 1000);
           const agentId = runtimeContext.agentId;
 
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
-          if (scope) {
-            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
-              return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
-              };
-            }
-          }
+          const resolvedScopes = resolveReadableToolScopeFilter(
+            runtimeContext.scopeManager,
+            agentId,
+            scope,
+          );
+          const { scopeFilter } = resolvedScopes;
+          const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
 
           const candidateLimit = Math.min(20, Math.max(safeLimit * 4, safeLimit));
-          const candidates = filterUserMdExclusiveRecallResults(await retrieveWithRetry(runtimeContext.retriever, {
+          const retrievedResults = await retrieveWithRetry(runtimeContext.retriever, {
             query,
             limit: candidateLimit,
             scopeFilter,
             category,
             source: "manual",
             lifecycleMode: mode,
-          }, () => runtimeContext.store.count()), runtimeContext.workspaceBoundary);
-          const results = candidates
-            .filter((result) =>
-              isMemoryVisibleInMode(
-                parseSmartMetadata(result.entry.metadata, result.entry),
-                mode,
-              ),
-            )
-            .slice(0, safeLimit);
+          }, () => runtimeContext.store.count());
+          const results = filterManualRecallResultNeighbors(
+            filterUserMdExclusiveRecallResults(retrievedResults, runtimeContext.workspaceBoundary),
+            runtimeContext.workspaceBoundary,
+          ).filter((result) => isMemoryVisibleInMode(
+            parseSmartMetadata(result.entry.metadata, result.entry), mode,
+          )).slice(0, safeLimit);
 
           if (results.length === 0) {
             return {
-              content: [{ type: "text", text: "No relevant memories found." }],
-              details: { count: 0, query, scopes: scopeFilter, lifecycleMode: mode },
+              content: [{ type: "text", text: [ignoredScopeNotice, "No relevant memories found."].filter(Boolean).join("\n") }],
+              details: { count: 0, query, scopes: scopeFilter, lifecycleMode: mode,
+                ignoredScope: resolvedScopes.ignoredScope, accessibleScopes: resolvedScopes.accessibleScopes },
             };
           }
 
           const now = Date.now();
-          if (mode === "active") await Promise.allSettled(
+          // Manual recall is a strong positive governance signal. Coalesce
+          // access deltas and suppression resets behind the response path so
+          // concurrent agents share one lock-safe metadata batch.
+          if (mode === "active") enqueueManualRecallMetadata(
+            runtimeContext.store,
             results.map((result) => {
-              const meta = parseSmartMetadata(result.entry.metadata, result.entry);
-              return runtimeContext.store.patchMetadata(
-                result.entry.id,
-                {
-                  access_count: meta.access_count + 1,
-                  last_accessed_at: now,
-                  last_confirmed_use_at: now,
-                  bad_recall_count: 0,
-                  suppressed_until_turn: 0,
-                  // Manual recall is a strong positive signal — clear active
-                  // ms-based suppression too, matching pre-Tier1 semantics
-                  // where zeroing the turn field cleared the only suppression
-                  // mechanism. Without this, governance keeps suppressing a
-                  // memory the user just explicitly searched for.
-                  suppressed_until_ms: 0,
+              const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+              return {
+                id: result.entry.id,
+                expectedScope: result.entry.scope,
+                accessCountDelta: 1,
+                accessedAt: now,
+                governanceSnapshot: {
+                  badRecallCount: metadata.bad_recall_count,
+                  suppressedUntilTurn: metadata.suppressed_until_turn,
+                  suppressedUntilMs: metadata.suppressed_until_ms,
                 },
-                scopeFilter,
-              );
+              };
             }),
           );
 
+          const surfaced: SurfacedRecall[] = [];
           const text = results
             .map((r, i) => {
               const categoryTag = getDisplayCategoryTag(r.entry);
@@ -693,15 +1086,23 @@ export function registerMemoryRecallTool(
                 ? (metadata.l2_content || metadata.l1_overview || r.entry.text)
                 : (metadata.l0_abstract || r.entry.text);
               const inline = normalizeInlineText(base);
+              const neighborText = r.neighbors && r.neighbors.length > 0
+                ? ` Neighbors: ${r.neighbors
+                  .map((neighbor) => `[${neighbor.entry.id}] ${truncateText(normalizeInlineText(neighbor.entry.text), 120)}`)
+                  .join("; ")}`
+                : "";
               const rendered = includeFullText
-                ? inline
-                : truncateText(inline, safeCharsPerItem);
+                ? `${inline}${neighborText}`
+                : truncateText(`${inline}${neighborText}`, safeCharsPerItem);
+              const withoutEllipsis = !includeFullText && inline.length + neighborText.length > safeCharsPerItem
+                ? rendered.slice(0, -1).trimEnd() : rendered;
+              surfaced.push({ result: r, sourceText: base, format: "manual", text: withoutEllipsis.slice(0, inline.length) });
               const lifecycleTag = mode === "active" ? "" : ` [state:${metadata.state}]`;
               return `${i + 1}. [${r.entry.id}] [${categoryTag}]${lifecycleTag} ${rendered}`;
             })
             .join("\n");
 
-          const serializedMemories = sanitizeMemoryForSerialization(results);
+          const serializedMemories = sanitizeMemoryForSerialization(results, { includeNeighbors: true });
           if (includeFullText) {
             for (let i = 0; i < results.length; i++) {
               const metadata = parseSmartMetadata(results[i].entry.metadata, results[i].entry);
@@ -710,11 +1111,15 @@ export function registerMemoryRecallTool(
             }
           }
 
+          await recordSurfacedRecall(options.api, options.invocation, query, surfaced);
           return {
             content: [
               {
                 type: "text",
-                text: `<relevant-memories>\n<mode:${includeFullText ? "full" : "summary"}>\nFound ${results.length} memories:\n\n${text}\n</relevant-memories>`,
+                text: [
+                  ignoredScopeNotice,
+                  `<relevant-memories>\n<mode:${includeFullText ? "full" : "summary"}>\nFound ${results.length} memories:\n\n${text}\n</relevant-memories>`,
+                ].filter(Boolean).join("\n"),
               },
             ],
             details: {
@@ -722,6 +1127,8 @@ export function registerMemoryRecallTool(
               memories: serializedMemories,
               query,
               scopes: scopeFilter,
+              ignoredScope: resolvedScopes.ignoredScope,
+              accessibleScopes: resolvedScopes.accessibleScopes,
               retrievalMode: runtimeContext.retriever.getConfig().mode,
               recallMode: includeFullText ? "full" : "summary",
               lifecycleMode: mode,
@@ -738,10 +1145,175 @@ export function registerMemoryRecallTool(
             details: { error: "recall_failed", message: String(error) },
           };
         }
-      },
-    };
+    },
+  };
+}
+
+export function registerMemoryRecallTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return createMemoryRecallTool(runtimeContext, {
+        api,
+        invocation: {
+          workspaceDir: toolCtx.workspaceDir, sessionKey: toolCtx.sessionKey, runId: toolCtx.runId,
+          assertActive: toolCtx.assertInvocationCurrent?.bind(toolCtx),
+        },
+        name: "memory_recall",
+        label: "Memory Recall",
+        description:
+          "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
+      });
     },
     { name: "memory_recall" },
+  );
+}
+
+export function registerMemoryRecallAliasTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+  alias: "memory_search" | "memory_get",
+) {
+  const label = alias === "memory_get" ? "Memory Get" : "Memory Search";
+  const description = alias === "memory_get"
+    ? "Compatibility alias for memory_recall. Search and return relevant long-term memories for OpenClaw profiles that request memory_get."
+    : "Compatibility alias for memory_recall. Search through long-term memories for OpenClaw profiles that request memory_search.";
+
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return createMemoryRecallTool(runtimeContext, {
+        api,
+        invocation: {
+          workspaceDir: toolCtx.workspaceDir, sessionKey: toolCtx.sessionKey, runId: toolCtx.runId,
+          assertActive: toolCtx.assertInvocationCurrent?.bind(toolCtx),
+        },
+        name: alias,
+        label,
+        description,
+      });
+    },
+    { name: alias },
+  );
+}
+
+export function registerMemoryFactQueryTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_fact_query",
+        label: "Memory Fact Query",
+        description:
+          "Deterministically query current or historical temporal facts by fact key or text without semantic reranking.",
+        parameters: Type.Object({
+          query: Type.Optional(Type.String({ description: "Text to match against fact keys and fact summaries." })),
+          factKey: Type.Optional(Type.String({ description: "Exact temporal fact key, such as preferences:drink." })),
+          at: Type.Optional(Type.String({ description: "ISO timestamp/date for as-of lookup. Defaults to now." })),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          includeHistory: Type.Optional(Type.Boolean({ description: "Include inactive superseded/expired facts (default false)." })),
+          limit: Type.Optional(Type.Number({ description: "Maximum facts to return (default 10, max 100)." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const {
+            query,
+            factKey,
+            at,
+            scope,
+            includeHistory = false,
+            limit = 10,
+          } = params as {
+            query?: string;
+            factKey?: string;
+            at?: string;
+            scope?: string;
+            includeHistory?: boolean;
+            limit?: number;
+          };
+
+          try {
+            const safeLimit = clampInt(limit, 1, 100);
+            const trimmedQuery = query?.trim();
+            const trimmedFactKey = factKey?.trim();
+            if (!trimmedQuery && !trimmedFactKey) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Fact query requires a query or exact factKey selector.",
+                }],
+                details: {
+                  action: "fact_query",
+                  error: "missing_selector",
+                },
+              };
+            }
+            const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+            const resolvedScopes = resolveReadableToolScopeFilter(runtimeContext.scopeManager, agentId, scope);
+            const atMs = parseFactQueryTimestamp(at);
+            const entries = await collectFactQueryMatches(
+              runtimeContext.store,
+              resolvedScopes.scopeFilter,
+              trimmedQuery,
+              trimmedFactKey,
+              atMs,
+              includeHistory,
+              safeLimit,
+              runtimeContext.workspaceBoundary,
+            );
+
+            const facts = entries
+              .map(({ fact }) => fact);
+
+            const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
+            const lines = facts.map((fact, index) => {
+              const status = fact.activeAt ? "active" : "historical";
+              const datePart = [fact.validFrom ? `from=${fact.validFrom}` : undefined, fact.validUntil ? `until=${fact.validUntil}` : undefined]
+                .filter(Boolean)
+                .join(" ");
+              return `${index + 1}. [${status}] ${fact.factKey ?? fact.memoryCategory ?? fact.category} ${datePart} ${truncateText(normalizeInlineText(fact.text), 180)}`.trim();
+            });
+
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  ignoredScopeNotice,
+                  lines.length > 0
+                    ? `Fact query returned ${facts.length} result(s) as of ${new Date(atMs).toISOString()}:\n${lines.join("\n")}`
+                    : `Fact query returned 0 result(s) as of ${new Date(atMs).toISOString()}.`,
+                ].filter(Boolean).join("\n"),
+              }],
+              details: {
+                action: "fact_query",
+                query: trimmedQuery,
+                factKey: trimmedFactKey,
+                asOf: new Date(atMs).toISOString(),
+                includeHistory,
+                count: facts.length,
+                ignoredScope: resolvedScopes.ignoredScope,
+                accessibleScopes: resolvedScopes.accessibleScopes,
+                facts,
+              },
+            };
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: `Fact query failed: ${error instanceof Error ? error.message : String(error)}`,
+              }],
+              details: { error: "fact_query_failed", message: String(error) },
+            };
+          }
+        },
+      };
+    },
+    { name: "memory_fact_query" },
   );
 }
 
@@ -768,6 +1340,11 @@ export function registerMemoryStoreTool(
             description: "Memory scope (optional, defaults to agent scope)",
           }),
         ),
+        force: Type.Optional(
+          Type.Boolean({
+            description: "Store even when the duplicate pre-check finds a very similar existing memory",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         const {
@@ -775,11 +1352,13 @@ export function registerMemoryStoreTool(
           importance = 0.7,
           category = "other",
           scope,
+          force = false,
         } = params as {
           text: string;
           importance?: number;
           category?: string;
           scope?: string;
+          force?: boolean;
         };
 
         try {
@@ -868,6 +1447,8 @@ export function registerMemoryStoreTool(
           }
 
           const safeImportance = clamp01(importance, 0.7);
+          const { memoryCategory, storageCategory } =
+            resolveToolMemoryCategory(category);
           const vector = await runtimeContext.embedder.embedPassage(stripped);
 
           // Temporal awareness: classify and infer expiry
@@ -877,139 +1458,340 @@ export function registerMemoryStoreTool(
           // (bypasses importance/recency weighting).
           // Fail-open by design: dedup must never block a legitimate memory write.
           // excludeInactive: superseded historical records must not block new writes.
-          // Align with TEMPORAL_VERSIONED_CATEGORIES: only preference and entity
-          // are semantically version-controlled. "fact"/"other" can reverse-map
-          // to unrelated semantic categories, risking cross-supersede.
-          const SUPERSEDE_ELIGIBLE: ReadonlySet<string> = new Set([
-            "preference", "entity",
-          ]);
-          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
-          try {
-            existing = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
-              targetScope,
-            ], { excludeInactive: true });
-          } catch (err) {
-            console.warn(
-              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
-            );
-          }
+          // Align with TEMPORAL_VERSIONED_CATEGORIES at the smart-category
+          // layer so legacy storage categories like "fact" don't cross-match
+          // unrelated profile/case memories.
+          const manualSupersede = runtimeContext.manualStoreSupersede === true;
+          const newFactKey = deriveFactKey(memoryCategory, stripped);
 
-          if (existing.length > 0 && existing[0].score > 0.98) {
+          // One discovery routine serves both passes: the ADVISORY pass below
+          // decides whether to enter the supersede path at all, and the store's
+          // atomic commit re-runs it under the write lock so the target set
+          // that actually commits reflects concurrent writers' work.
+          const runSupersedeDiscovery = async (): Promise<{
+            neighbors: Awaited<ReturnType<MemoryStore["vectorSearch"]>>;
+            duplicateCandidate: Awaited<ReturnType<MemoryStore["vectorSearch"]>>[number] | undefined;
+            manual: boolean;
+            targets: Array<{ entry: MemoryEntry; score?: number }>;
+          }> => {
+            // Check for duplicates / supersede candidates using raw vector
+            // similarity (bypasses importance/recency weighting).
+            // Fail-open by design: dedup must never block a legitimate write.
+            // excludeInactive: superseded historical records must not block
+            // new writes.
+            let neighbors: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
+            try {
+              neighbors = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
+                targetScope,
+              ], { excludeInactive: true });
+            } catch (err) {
+              console.warn(
+                `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+            const duplicateCandidate = neighbors[0]?.score > 0.98 ? neighbors[0] : undefined;
+            // Key collisions resolve through a COMPLETE scope lookup, never the
+            // vector top-K: a same-key row ranked behind closer unrelated
+            // neighbors, or below the similarity floor, is exactly the stale
+            // value this path exists to supersede. Fail-open like the duplicate
+            // pre-check: a lookup error stores alongside instead of blocking.
+            let activeFactKeyEntries: MemoryEntry[] = [];
+            if (manualSupersede && !force && newFactKey) {
+              try {
+                activeFactKeyEntries = await findActiveFactKeyEntries(
+                  runtimeContext.store,
+                  [targetScope],
+                  newFactKey,
+                );
+              } catch (err) {
+                // An over-bound candidate set is NOT the fail-open class: a
+                // store-alongside here silently abandons the supersession
+                // invariant, so the write is rejected explicitly instead.
+                if (err instanceof FactKeyScanOverBoundError) {
+                  throw err;
+                }
+                console.warn(
+                  `memory-lancedb-pro: fact-key lookup failed, continue store: ${String(err)}`,
+                );
+              }
+            }
+            const manualPriorityTargets: Array<{ entry: MemoryEntry; score?: number }> = [];
+            if (manualSupersede && !force) {
+              if (duplicateCandidate) {
+                manualPriorityTargets.push(duplicateCandidate);
+              }
+              for (const entry of activeFactKeyEntries) {
+                if (!manualPriorityTargets.some((target) => target.entry.id === entry.id)) {
+                  manualPriorityTargets.push({ entry });
+                }
+              }
+            }
+            // Auto-supersede band: similar memory (0.95-0.98), same
+            // storage-layer category, eligible category.
+            const bandCandidate = neighbors.find(
+              (r) =>
+                r.score > 0.95 &&
+                r.score <= 0.98 &&
+                TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
+                matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata),
+            );
+            const targets = manualPriorityTargets.length > 0
+              ? manualPriorityTargets
+              : bandCandidate
+                ? [bandCandidate]
+                : [];
+            return {
+              neighbors,
+              duplicateCandidate,
+              manual: manualPriorityTargets.length > 0,
+              targets,
+            };
+          };
+
+          // An over-bound fact-key scan rejects the opted-in write explicitly:
+          // storing alongside would silently leave the old same-key value
+          // active, and pretending "created" hides exactly the failure the
+          // supersede contract exists to prevent. force: true bypasses the
+          // scan entirely and stores without superseding.
+          const buildOverBoundRejection = (err: FactKeyScanOverBoundError) => ({
+            content: [
+              {
+                type: "text",
+                text: err.message,
+              },
+            ],
+            details: {
+              action: "rejected",
+              reason: "fact-key-scan-over-bound",
+            },
+          });
+
+          let discovery: Awaited<ReturnType<typeof runSupersedeDiscovery>>;
+          try {
+            discovery = await runSupersedeDiscovery();
+          } catch (err) {
+            if (err instanceof FactKeyScanOverBoundError) {
+              return buildOverBoundRejection(err);
+            }
+            throw err;
+          }
+          const duplicateCandidate = discovery.duplicateCandidate;
+          if (duplicateCandidate && !force && !manualSupersede) {
             return {
               content: [
                 {
                   type: "text",
-                  text: `Similar memory already exists: "${existing[0].entry.text}"`,
+                  text: `Similar memory already exists: "${duplicateCandidate.entry.text}"`,
                 },
               ],
               details: {
                 action: "duplicate",
-                existingId: existing[0].entry.id,
-                existingText: existing[0].entry.text,
-                existingScope: existing[0].entry.scope,
-                similarity: existing[0].score,
+                existingId: duplicateCandidate.entry.id,
+                existingText: duplicateCandidate.entry.text,
+                existingScope: duplicateCandidate.entry.scope,
+                similarity: duplicateCandidate.score,
               },
             };
           }
 
-          // Auto-supersede: if a similar memory exists (0.95-0.98 similarity),
-          // same storage-layer category, and category is eligible, mark the old
-          // one as superseded and store the new one with a supersedes link.
-          const supersedeCandidate = existing.find(
-            (r) =>
-              r.score > 0.95 &&
-              r.score <= 0.98 &&
-              r.entry.category === category &&
-              SUPERSEDE_ELIGIBLE.has(r.entry.category),
-          );
-
-          if (supersedeCandidate) {
-            const oldEntry = supersedeCandidate.entry;
-            const oldMeta = parseSmartMetadata(oldEntry.metadata, oldEntry);
-            const now = Date.now();
-            const factKey =
-              oldMeta.fact_key ?? deriveFactKey(oldMeta.memory_category, text);
-
-            // Store new memory with supersedes link, preserving canonical fields
-            // from the old entry (aligns with memory_update supersede path).
-            const newMeta = buildSmartMetadata(
-              { text, category: category as any, importance: safeImportance },
-              {
-                l0_abstract: text,
-                l1_overview: oldMeta.l1_overview || `- ${text}`,
-                l2_content: text,
-                memory_category: oldMeta.memory_category,
-                tier: oldMeta.tier,
-                source: "manual",
-                state: "confirmed",
-                memory_layer: deriveManualMemoryLayer(category as string),
-                last_confirmed_use_at: now,
-                bad_recall_count: 0,
-                suppressed_until_turn: 0,
-                valid_from: now,
-                fact_key: factKey,
-                supersedes: [oldEntry.id],
-                relations: appendRelation([], {
-                  type: "supersedes",
-                  targetId: oldEntry.id,
-                }),
-              },
-            );
-
-            const newEntry = await runtimeContext.store.store({
-              text,
-              vector,
-              importance: safeImportance,
-              category: category as any,
-              scope: targetScope,
-              metadata: stringifySmartMetadata(newMeta),
-            });
-
-            // Invalidate old record
-            try {
-              await runtimeContext.store.patchMetadata(
-                oldEntry.id,
+          // Manual-priority supersede (manualStoreSupersede): a manual store
+          // always takes priority — its text lands verbatim, and a similar
+          // existing row yields to it. Targets, in order: the near-identical
+          // neighbor the duplicate check used to reject, then an active
+          // neighbor holding the same fact key at any similarity (the
+          // update/contradiction shape, e.g. a new value for a versioned
+          // fact). Anything else falls through to the versioned-band check,
+          // and past that stores alongside: a wrong supersede destroys a real
+          // fact, while a duplicate is fixable noise.
+          // A manual-priority write with an EMPTY advisory still enters the
+          // locked path: two first-time same-key writers otherwise both see
+          // nothing and both plain-store, leaving two active rows for one
+          // fact key. The locked rediscovery is authoritative; when it also
+          // finds nothing, the commit is a plain create.
+          const manualPriorityWrite = manualSupersede && !force;
+          if (discovery.targets.length > 0 || manualPriorityWrite) {
+            // Canonical identity comes from the REQUESTED store, never from a
+            // near-duplicate donor: the new row's category and fact key are the
+            // requested ones, and overview/tier inherit only from a
+            // category-verified target (the band shape). Temporal expiry is
+            // preserved exactly like the plain-store path.
+            const buildSupersedeMetadata = (targets: MemoryEntry[], manualPriority: boolean): string => {
+              const now = Date.now();
+              const verified = targets
+                .map((target) => ({ target, meta: parseSmartMetadata(target.metadata, target) }))
+                .find(({ target }) =>
+                  matchesMemoryCategoryFilter(target.category, memoryCategory, target.metadata),
+                );
+              // The band keeps the verified target's ESTABLISHED key: deriving
+              // one from the replacement's wording would split the fact's
+              // history across two canonical identities. Requested-key
+              // precedence is the opt-in manual-priority contract only.
+              const factKey = manualPriority
+                ? newFactKey ?? verified?.meta.fact_key ?? undefined
+                : verified?.meta.fact_key ?? newFactKey ?? undefined;
+              const primary = targets[0];
+              return stringifySmartMetadata(buildSmartMetadata(
+                { text, category: storageCategory, importance: safeImportance },
                 {
-                  fact_key: factKey,
-                  invalidated_at: now,
-                  superseded_by: newEntry.id,
-                  relations: appendRelation(oldMeta.relations, {
-                    type: "superseded_by",
-                    targetId: newEntry.id,
-                  }),
+                  l0_abstract: text,
+                  // A manual-priority supersede replaces the fact's VALUE, so
+                  // the old row's overview is stale by definition; the band
+                  // case keeps the richer overview of its category-verified
+                  // target as before.
+                  l1_overview: manualPriority ? `- ${text}` : verified?.meta.l1_overview || `- ${text}`,
+                  l2_content: text,
+                  memory_category: memoryCategory,
+                  tier: verified?.meta.tier,
+                  source: "manual",
+                  state: "confirmed",
+                  memory_layer: deriveManualMemoryLayer(memoryCategory),
+                  last_confirmed_use_at: now,
+                  bad_recall_count: 0,
+                  suppressed_until_turn: 0,
+                  valid_from: now,
+                  memory_temporal_type: temporalType,
+                  valid_until: validUntil,
+                  ...(factKey ? { fact_key: factKey } : {}),
+                  ...(primary ? { supersedes: [primary.id] } : {}),
+                  relations: targets.reduce(
+                    (relations, target) =>
+                      appendRelation(relations, {
+                        type: "supersedes",
+                        targetId: target.id,
+                      }),
+                    [] as ReturnType<typeof appendRelation>,
+                  ),
                 },
-                [targetScope],
-              );
-            } catch (patchErr) {
-              // New record is already the source of truth; log but don't fail
+              ));
+            };
+
+            const buildInvalidationPatch = (target: MemoryEntry, newEntryId: string) => {
+              const targetMeta = parseSmartMetadata(target.metadata, target);
+              const sameCategory = matchesMemoryCategoryFilter(target.category, memoryCategory, target.metadata);
+              return {
+                // Backfill a missing fact key only on a category-verified
+                // target: stamping the new key onto a foreign-category
+                // near-duplicate would misfile it.
+                ...(!targetMeta.fact_key && sameCategory && newFactKey ? { fact_key: newFactKey } : {}),
+                invalidated_at: Date.now(),
+                superseded_by: newEntryId,
+                relations: appendRelation(targetMeta.relations, {
+                  type: "superseded_by",
+                  targetId: newEntryId,
+                }),
+              };
+            };
+
+            // Commit atomically at the store layer: recheck, insert, and
+            // invalidate run under one write lock, so concurrent same-key
+            // writers converge on a single active row instead of leaving two
+            // replacements standing.
+            let lastDiscovery = discovery;
+            let committed: Awaited<ReturnType<MemoryStore["storeSuperseding"]>>;
+            try {
+              committed = await runtimeContext.store.storeSuperseding({
+                entry: {
+                  text,
+                  vector,
+                  importance: safeImportance,
+                  category: storageCategory,
+                  scope: targetScope,
+                  metadata: "{}",
+                },
+                scopeFilter: [targetScope],
+                discoverTargets: async () => {
+                  lastDiscovery = await runSupersedeDiscovery();
+                  return lastDiscovery.targets.map((target) => target.entry);
+                },
+                finalizeEntryMetadata: (targets) =>
+                  buildSupersedeMetadata(targets, lastDiscovery.manual),
+                buildTargetPatch: buildInvalidationPatch,
+              });
+            } catch (err) {
+              // The locked recheck hit the scan bound (the scope crossed it
+              // after the advisory pass): the write aborts before the insert,
+              // so rejecting here leaves no partial state behind.
+              if (err instanceof FactKeyScanOverBoundError) {
+                return buildOverBoundRejection(err);
+              }
+              throw err;
+            }
+            const newEntry = committed.entry;
+            const { supersededIds, invalidationFailures } = committed;
+            for (const failure of invalidationFailures) {
+              // The new record is already stored; surface the unconfirmed
+              // invalidation instead of silently reporting it as superseded.
               console.warn(
-                `memory-pro: failed to patch superseded record ${oldEntry.id.slice(0, 8)}: ${patchErr}`,
+                `memory-pro: failed to invalidate superseded record ${failure.id.slice(0, 8)}: ${failure.reason}`,
               );
             }
+
+            // The replaced statements leave the echo ledger with the rows:
+            // a reversal back to a superseded text is new information once
+            // the store no longer holds that fact.
+            for (const target of lastDiscovery.targets) {
+              if (supersededIds.includes(target.entry.id)) {
+                context.manualEchoLedger?.invalidate(agentId, target.entry.text);
+              }
+            }
+            context.manualEchoLedger?.record(agentId, text);
 
             // Dual-write to Markdown mirror if enabled
             if (context.mdMirror) {
               await context.mdMirror(
-                { text, category: category as string, scope: targetScope, timestamp: newEntry.timestamp },
+                { text, category: storageCategory, scope: targetScope, timestamp: newEntry.timestamp },
                 { source: "memory_store", agentId },
               );
             }
 
+            if (lastDiscovery.targets.length === 0) {
+              // First writer of this fact: the authoritative locked discovery
+              // found nothing to supersede, so this commit was a plain create
+              // and must report as one, not as "superseded no memories".
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Stored: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}" in scope '${targetScope}'`,
+                  },
+                ],
+                details: {
+                  action: "created",
+                  id: newEntry.id,
+                  scope: newEntry.scope,
+                  category: memoryCategory,
+                  rawCategory: newEntry.category,
+                  importance: newEntry.importance,
+                },
+              };
+            }
+
+            const supersededLabel = supersededIds.length > 1
+              ? `${supersededIds.length} memories (${supersededIds.map((id) => id.slice(0, 8)).join(", ")})`
+              : supersededIds.length === 1
+                ? `memory ${supersededIds[0].slice(0, 8)}...`
+                : "no memories";
+            const failureSuffix = invalidationFailures.length > 0
+              ? ` (${invalidationFailures.length} invalidation(s) failed; those rows may still be active)`
+              : "";
             return {
               content: [
                 {
                   type: "text",
-                  text: `Superseded memory ${oldEntry.id.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                  text: `Superseded ${supersededLabel} → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"${failureSuffix}`,
                 },
               ],
               details: {
                 action: "superseded",
                 id: newEntry.id,
-                supersededId: oldEntry.id,
+                supersededId: supersededIds[0] ?? null,
+                supersededIds,
+                ...(invalidationFailures.length > 0 ? { invalidationFailures } : {}),
                 scope: newEntry.scope,
-                category: newEntry.category,
+                category: memoryCategory,
+                rawCategory: newEntry.category,
                 importance: newEntry.importance,
-                similarity: supersedeCandidate.score,
+                similarity: lastDiscovery.targets[0]?.score,
               },
             };
           }
@@ -1018,22 +1800,23 @@ export function registerMemoryStoreTool(
             text,
             vector,
             importance: safeImportance,
-            category: category as any,
+            category: storageCategory,
             scope: targetScope,
             metadata: stringifySmartMetadata(
               buildSmartMetadata(
                 {
                   text,
-                  category: category as any,
+                  category: storageCategory,
                   importance: safeImportance,
                 },
                 {
                   l0_abstract: text,
                   l1_overview: `- ${text}`,
                   l2_content: text,
+                  memory_category: memoryCategory,
                   source: "manual",
                   state: "confirmed",
-                  memory_layer: deriveManualMemoryLayer(category as string),
+                  memory_layer: deriveManualMemoryLayer(memoryCategory),
                   last_confirmed_use_at: Date.now(),
                   bad_recall_count: 0,
                   suppressed_until_turn: 0,
@@ -1044,10 +1827,12 @@ export function registerMemoryStoreTool(
             ),
           });
 
+          context.manualEchoLedger?.record(agentId, text);
+
           // Dual-write to Markdown mirror if enabled
           if (context.mdMirror) {
             await context.mdMirror(
-              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
+              { text, category: storageCategory, scope: targetScope, timestamp: entry.timestamp },
               { source: "memory_store", agentId },
             );
           }
@@ -1063,8 +1848,17 @@ export function registerMemoryStoreTool(
               action: "created",
               id: entry.id,
               scope: entry.scope,
-              category: entry.category,
+              category: memoryCategory,
+              rawCategory: entry.category,
               importance: entry.importance,
+              ...(duplicateCandidate && force
+                ? { duplicateOverride: {
+                  existingId: duplicateCandidate.entry.id,
+                  existingText: duplicateCandidate.entry.text,
+                  existingScope: duplicateCandidate.entry.scope,
+                  similarity: duplicateCandidate.score,
+                } }
+                : {}),
             },
           };
         } catch (error) {
@@ -1138,23 +1932,39 @@ export function registerMemoryForgetTool(
           }
 
           if (memoryId) {
-            const deleted = await context.store.delete(memoryId, scopeFilter);
+            const resolved = await resolveMemoryId(context, memoryId, scopeFilter, { requireExactRef: true });
+            if (resolved.ok === false) {
+              return {
+                content: [{ type: "text", text: resolved.message }],
+                details: resolved.details ?? { error: "not_found", id: memoryId },
+              };
+            }
+            const forgottenRow = context.manualEchoLedger
+              ? await context.store.getById(resolved.id, scopeFilter).catch(() => null)
+              : null;
+            const deleted = await context.store.delete(resolved.id, scopeFilter);
             if (deleted) {
+              // A forgotten fact must not keep suppressing its own
+              // re-statement through the echo ledger.
+              if (forgottenRow?.text) {
+                context.manualEchoLedger?.invalidate(agentId, forgottenRow.text);
+              }
+              context.onMemoriesDeleted?.({ scopeFilter });
               return {
                 content: [
-                  { type: "text", text: `Memory ${memoryId} forgotten.` },
+                  { type: "text", text: `Memory ${resolved.id} forgotten.` },
                 ],
-                details: { action: "deleted", id: memoryId },
+                details: { action: "deleted", id: resolved.id },
               };
             } else {
               return {
                 content: [
                   {
                     type: "text",
-                    text: `Memory ${memoryId} not found or access denied.`,
+                    text: `Memory ${resolved.id} not found or access denied.`,
                   },
                 ],
-                details: { error: "not_found", id: memoryId },
+                details: { error: "not_found", id: resolved.id },
               };
             }
           }
@@ -1181,6 +1991,8 @@ export function registerMemoryForgetTool(
                 scopeFilter,
               );
               if (deleted) {
+                context.manualEchoLedger?.invalidate(agentId, results[0].entry.text);
+                context.onMemoriesDeleted?.({ scopeFilter });
                 return {
                   content: [
                     {
@@ -1292,55 +2104,29 @@ export function registerMemoryUpdateTool(
               details: { error: "no_updates" },
             };
           }
+          const categoryResolution = category
+            ? resolveToolMemoryCategory(category)
+            : undefined;
 
           // Determine accessible scopes
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
           const scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
 
-          // Resolve memoryId: if it doesn't look like a UUID, try search
-          let resolvedId = memoryId;
-          const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
-          if (!uuidLike) {
-            // Treat as search query
-            const results = await retrieveWithRetry(context.retriever, {
-              query: memoryId,
-              limit: 3,
-              scopeFilter,
-            }, () => context.store.count());
-            if (results.length === 0) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `No memory found matching "${memoryId}".`,
-                  },
-                ],
-                details: { error: "not_found", query: memoryId },
-              };
-            }
-            if (results.length === 1 || results[0].score > 0.85) {
-              resolvedId = results[0].entry.id;
-            } else {
-              const list = results
-                .map(
-                  (r) =>
-                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
-                )
-                .join("\n");
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Multiple matches. Specify memoryId:\n${list}`,
-                  },
-                ],
-                details: {
-                  action: "candidates",
-                  candidates: sanitizeMemoryForSerialization(results),
-                },
-              };
-            }
+          // memoryId promises a UUID or an 8+ char id prefix; both resolve
+          // exactly. Anything else is rejected instead of falling through to
+          // semantic retrieval: update mutates (and can supersede) whatever
+          // row it resolves, so a malformed id-shaped input must never be
+          // allowed to select an unrelated row by low-score similarity.
+          const resolution = await resolveMemoryId(context, memoryId, scopeFilter, {
+            requireExactRef: true,
+          });
+          if (resolution.ok === false) {
+            return {
+              content: [{ type: "text", text: resolution.message }],
+              details: resolution.details ?? { error: "not_found", id: memoryId },
+            };
           }
+          const resolvedId = resolution.id;
 
           // If text changed, re-embed; reject noise
           let newVector: number[] | undefined;
@@ -1363,7 +2149,7 @@ export function registerMemoryUpdateTool(
           // importance-only change that still needs metadata sync). Shared by
           // the temporal supersede guard and the normal-path metadata rebuild.
           let existing: MemoryEntry | null = null;
-          if (text || importance !== undefined) {
+          if (text || importance !== undefined || categoryResolution) {
             existing = await context.store.getById(resolvedId, scopeFilter);
           }
 
@@ -1373,18 +2159,22 @@ export function registerMemoryUpdateTool(
           if (text && newVector && existing) {
             const meta = parseSmartMetadata(existing.metadata, existing);
             if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
+                const effectiveMemoryCategory =
+                  categoryResolution?.memoryCategory ?? meta.memory_category;
+                const effectiveStorageCategory =
+                  categoryResolution?.storageCategory ?? existing.category;
                 const now = Date.now();
                 const factKey =
-                  meta.fact_key ?? deriveFactKey(meta.memory_category, text);
+                  meta.fact_key ?? deriveFactKey(effectiveMemoryCategory, text);
 
                 // Create new superseding record
                 const newMeta = buildSmartMetadata(
-                  { text, category: existing.category },
+                  { text, category: effectiveStorageCategory },
                   {
                     l0_abstract: text,
                     l1_overview: meta.l1_overview,
                     l2_content: text,
-                    memory_category: meta.memory_category,
+                    memory_category: effectiveMemoryCategory,
                     tier: meta.tier,
                     access_count: 0,
                     confidence: importance !== undefined ? clamp01(importance, 0.7) : meta.confidence,
@@ -1401,7 +2191,7 @@ export function registerMemoryUpdateTool(
                 const newEntry = await context.store.store({
                   text,
                   vector: newVector,
-                  category: category ? (category as any) : existing.category,
+                  category: effectiveStorageCategory,
                   scope: existing.scope,
                   importance:
                     importance !== undefined
@@ -1433,6 +2223,13 @@ export function registerMemoryUpdateTool(
                   );
                 }
 
+                // The superseding write succeeded: this text will echo through
+                // the same turn's auto-capture extraction exactly like a plain
+                // manual store, so it must be recorded on this early-return
+                // path too, and the replaced text must stop suppressing its
+                // own re-statement.
+                context.manualEchoLedger?.invalidate(agentId, existing.text);
+                context.manualEchoLedger?.record(agentId, text);
                 return {
                   content: [
                     {
@@ -1444,7 +2241,7 @@ export function registerMemoryUpdateTool(
                     action: "superseded",
                     oldId: resolvedId,
                     newId: newEntry.id,
-                    category: meta.memory_category,
+                    category: effectiveMemoryCategory,
                   },
                 };
             }
@@ -1456,16 +2253,18 @@ export function registerMemoryUpdateTool(
           if (newVector) updates.vector = newVector;
           if (importance !== undefined)
             updates.importance = clamp01(importance, 0.7);
-          if (category) updates.category = category;
+          if (categoryResolution) updates.category = categoryResolution.storageCategory;
 
           // Rebuild smart metadata when text or importance changes (#544)
           if (text && existing) {
             const meta = parseSmartMetadata(existing.metadata, existing);
-            const effectiveCategory = (category as any) ?? meta.memory_category;
+            const effectiveCategory =
+              categoryResolution?.memoryCategory ?? meta.memory_category;
             const updatedMeta = buildSmartMetadata(existing, {
               l0_abstract: text,
               l1_overview: `- ${text}`,
               l2_content: text,
+              memory_category: effectiveCategory,
               fact_key: deriveFactKey(effectiveCategory, text),
               memory_temporal_type: classifyTemporal(text),
               confidence:
@@ -1478,10 +2277,15 @@ export function registerMemoryUpdateTool(
             // clears any stale value inherited from the previous text.
             updatedMeta.valid_until = inferExpiry(text);
             updates.metadata = stringifySmartMetadata(updatedMeta);
-          } else if (importance !== undefined && existing) {
-            // Sync confidence for importance-only changes
+          } else if ((importance !== undefined || categoryResolution) && existing) {
+            // Sync metadata for importance/category-only changes
             const updatedMeta = buildSmartMetadata(existing, {
-              confidence: clamp01(importance, 0.7),
+              ...(importance !== undefined
+                ? { confidence: clamp01(importance, 0.7) }
+                : {}),
+              ...(categoryResolution
+                ? { memory_category: categoryResolution.memoryCategory }
+                : {}),
             });
             updates.metadata = stringifySmartMetadata(updatedMeta);
           }
@@ -1502,6 +2306,16 @@ export function registerMemoryUpdateTool(
               ],
               details: { error: "not_found", id: resolvedId },
             };
+          }
+
+          // Only a manually supplied text arms the echo guard: a metadata-only
+          // update (importance, category) restates nothing, so it must not
+          // suppress a later extraction of the unchanged fact.
+          if (text && existing) {
+            if (updated.text !== existing.text) {
+              context.manualEchoLedger?.invalidate(agentId, existing.text);
+            }
+            context.manualEchoLedger?.record(agentId, updated.text);
           }
 
           return {
@@ -1552,7 +2366,7 @@ export function registerMemoryStatsTool(
       return {
         name: "memory_stats",
       label: "Memory Statistics",
-      description: "Get statistics about memory usage, scopes, and categories.",
+      description: "Get statistics about memory usage, scopes, and categories. Defaults to the caller's accessible scopes when scope is omitted.",
       parameters: Type.Object({
         scope: Type.Optional(
           Type.String({
@@ -1565,23 +2379,9 @@ export function registerMemoryStatsTool(
 
         try {
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
-              return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
-              };
-            }
-          }
+          const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+          const { scopeFilter } = resolvedScopes;
+          const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
 
           const stats = await context.store.stats(scopeFilter);
           const scopeManagerStats = context.scopeManager.getStats();
@@ -1628,13 +2428,16 @@ export function registerMemoryStatsTool(
             }
           }
 
-          const text = textLines.join("\n");
+          const text = [ignoredScopeNotice, textLines.join("\n")].filter(Boolean).join("\n");
 
           return {
             content: [{ type: "text", text }],
             details: {
               stats,
               scopeManagerStats,
+              scopes: scopeFilter,
+              ignoredScope: resolvedScopes.ignoredScope,
+              accessibleScopes: resolvedScopes.accessibleScopes,
               retrievalConfig: {
                 ...retrievalConfig,
                 rerankApiKey: retrievalConfig.rerankApiKey ? "***" : undefined,
@@ -1667,7 +2470,7 @@ export function registerMemoryDebugTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const staticAgentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId);
       return {
         name: "memory_debug",
         label: "Memory Debug",
@@ -1682,35 +2485,35 @@ export function registerMemoryDebugTool(
             Type.String({ description: "Specific memory scope to search in (optional)" }),
           ),
         }),
-        async execute(_toolCallId, params) {
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
           const { query, limit = 5, scope } = params as {
             query: string; limit?: number; scope?: string;
           };
           try {
             const safeLimit = clampInt(limit, 1, 20);
-            let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-            if (scope) {
-              if (context.scopeManager.isAccessible(scope, agentId)) {
-                scopeFilter = [scope];
-              } else {
-                return {
-                  content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                  details: { error: "scope_access_denied", requestedScope: scope },
-                };
-              }
-            }
+            const agentId = resolveRuntimeAgentId(staticAgentId, runtimeCtx);
+            const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+            const { scopeFilter } = resolvedScopes;
+            const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
 
             const { results, trace } = await context.retriever.retrieveWithTrace({
               query, limit: safeLimit, scopeFilter, source: "manual",
             });
 
             const traceLines: string[] = [
+              ...(ignoredScopeNotice ? [ignoredScopeNotice, ""] : []),
               `Retrieval Debug Trace:`,
               `  Mode: ${trace.mode}`,
               `  Total: ${trace.totalMs}ms`,
               `  Stages:`,
             ];
             for (const stage of trace.stages) {
+              if (stage.kind === "operation") {
+                traceLines.push(
+                  `    ${stage.name}: completed ${stage.durationMs}ms`,
+                );
+                continue;
+              }
               const dropped = Math.max(0, stage.inputCount - stage.outputCount);
               const scoreStr = stage.scoreRange
                 ? ` scores=[${stage.scoreRange[0].toFixed(3)}, ${stage.scoreRange[1].toFixed(3)}]`
@@ -1735,7 +2538,13 @@ export function registerMemoryDebugTool(
               traceLines.push(``, `No results survived the pipeline.`);
               return {
                 content: [{ type: "text", text: traceLines.join("\n") }],
-                details: { count: 0, query, trace },
+                details: {
+                  count: 0,
+                  query,
+                  trace,
+                  ignoredScope: resolvedScopes.ignoredScope,
+                  accessibleScopes: resolvedScopes.accessibleScopes,
+                },
               };
             }
 
@@ -1745,7 +2554,10 @@ export function registerMemoryDebugTool(
               if (r.sources.bm25) sources.push("BM25");
               if (r.sources.reranked) sources.push("reranked");
               const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text.slice(0, 120)}${r.entry.text.length > 120 ? "..." : ""} (${(r.score * 100).toFixed(1)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+              const neighborText = r.neighbors && r.neighbors.length > 0
+                ? ` neighbors=${r.neighbors.map((neighbor) => neighbor.entry.id).join(",")}`
+                : "";
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text.slice(0, 120)}${r.entry.text.length > 120 ? "..." : ""} (${(r.score * 100).toFixed(1)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""}${neighborText})`;
             });
 
             const text = [...traceLines, ``, `Results (${results.length}):`, ...resultLines].join("\n");
@@ -1756,6 +2568,8 @@ export function registerMemoryDebugTool(
                 memories: sanitizeMemoryForSerialization(results),
                 query,
                 trace,
+                ignoredScope: resolvedScopes.ignoredScope,
+                accessibleScopes: resolvedScopes.accessibleScopes,
               },
             };
           } catch (error) {
@@ -1785,7 +2599,7 @@ export function registerMemoryListTool(
         name: "memory_list",
       label: "Memory List",
       description:
-        "List recent memories with optional filtering by scope and category.",
+        "List recent memories with optional filtering by scope and category. Defaults to the caller's accessible scopes when scope is omitted.",
       parameters: Type.Object({
         limit: Type.Optional(
           Type.Number({
@@ -1801,6 +2615,9 @@ export function registerMemoryListTool(
             description: "Number of memories to skip (default: 0)",
           }),
         ),
+        includeInvalidated: Type.Optional(
+          Type.Boolean({ description: "Include invalidated/superseded rows (default false)." }),
+        ),
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const {
@@ -1808,11 +2625,13 @@ export function registerMemoryListTool(
           scope,
           category,
           offset = 0,
+          includeInvalidated = false,
         } = params as {
           limit?: number;
           scope?: string;
           category?: string;
           offset?: number;
+          includeInvalidated?: boolean;
         };
 
         try {
@@ -1820,38 +2639,28 @@ export function registerMemoryListTool(
           const safeOffset = clampInt(offset, 0, 1000);
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
 
-          // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
-              scopeFilter = [scope];
-            } else {
-              return {
-                content: [
-                  { type: "text", text: `Access denied to scope: ${scope}` },
-                ],
-                details: {
-                  error: "scope_access_denied",
-                  requestedScope: scope,
-                },
-              };
-            }
-          }
+          const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+          const { scopeFilter } = resolvedScopes;
+          const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
 
           const entries = await context.store.list(
             scopeFilter,
             category,
             safeLimit,
             safeOffset,
+            { excludeInactive: !includeInvalidated },
           );
 
           if (entries.length === 0) {
             return {
-              content: [{ type: "text", text: "No memories found." }],
+              content: [{ type: "text", text: [ignoredScopeNotice, "No memories found."].filter(Boolean).join("\n") }],
               details: {
                 count: 0,
                 filters: {
                   scope,
+                  scopes: scopeFilter,
+                  ignoredScope: resolvedScopes.ignoredScope,
+                  accessibleScopes: resolvedScopes.accessibleScopes,
                   category,
                   limit: safeLimit,
                   offset: safeOffset,
@@ -1874,7 +2683,7 @@ export function registerMemoryListTool(
             content: [
               {
                 type: "text",
-                text: `Recent memories (showing ${entries.length}):\n\n${text}`,
+                text: [ignoredScopeNotice, `Recent memories (showing ${entries.length}):\n\n${text}`].filter(Boolean).join("\n"),
               },
             ],
             details: {
@@ -1890,6 +2699,9 @@ export function registerMemoryListTool(
               })),
               filters: {
                 scope,
+                scopes: scopeFilter,
+                ignoredScope: resolvedScopes.ignoredScope,
+                accessibleScopes: resolvedScopes.accessibleScopes,
                 category,
                 limit: safeLimit,
                 offset: safeOffset,
@@ -1980,10 +2792,14 @@ export function registerMemoryPromoteTool(
             scopeFilter = [scope];
           }
 
+          // Dual selector: memoryId is the exact reference (UUID or 8+ char
+          // prefix, resolved exactly — this path mutates state); query is the
+          // explicit semantic selector and keeps retrieval-based resolution.
           const resolved = await resolveMemoryId(
             runtimeContext,
             memoryId ?? query ?? "",
             scopeFilter,
+            memoryId ? { requireExactRef: true } : undefined,
           );
           if (resolved.ok === false) {
             return {
@@ -2087,10 +2903,14 @@ export function registerMemoryArchiveTool(
             scopeFilter = [scope];
           }
 
+          // Dual selector: memoryId is the exact reference (UUID or 8+ char
+          // prefix, resolved exactly — this path mutates state); query is the
+          // explicit semantic selector and keeps retrieval-based resolution.
           const resolved = await resolveMemoryId(
             runtimeContext,
             memoryId ?? query ?? "",
             scopeFilter,
+            memoryId ? { requireExactRef: true } : undefined,
           );
           if (resolved.ok === false) {
             return {
@@ -2124,6 +2944,209 @@ export function registerMemoryArchiveTool(
   );
 }
 
+export function registerMemoryReflectionResolveTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_reflection_resolve",
+        label: "Memory Reflection Resolve",
+        description:
+          "Mark a single memory-reflection item resolved so it stops participating in reflection recall.",
+        parameters: Type.Object({
+          memoryId: Type.Optional(Type.String({ description: "Reflection item id or id prefix." })),
+          query: Type.Optional(Type.String({ description: "Search query to preview matching unresolved reflection items." })),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          dryRun: Type.Optional(Type.Boolean({ description: "Preview only. Defaults to true for query mode and false for memoryId mode." })),
+          note: Type.Optional(Type.String({ description: "Optional resolution note for audit trail." })),
+          limit: Type.Optional(Type.Number({ description: "Maximum query candidates to preview (default 5, max 20)." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const {
+            memoryId,
+            query,
+            scope,
+            dryRun,
+            note,
+            limit = 5,
+          } = params as {
+            memoryId?: string;
+            query?: string;
+            scope?: string;
+            dryRun?: boolean;
+            note?: string;
+            limit?: number;
+          };
+
+          const trimmedMemoryId = memoryId?.trim();
+          const trimmedQuery = query?.trim();
+          if (!trimmedMemoryId && !trimmedQuery) {
+            return {
+              content: [{ type: "text", text: "Provide memoryId or query." }],
+              details: { error: "missing_selector" },
+            };
+          }
+          if (trimmedMemoryId && trimmedQuery) {
+            return {
+              content: [{ type: "text", text: "Provide only one of memoryId or query." }],
+              details: { error: "ambiguous_selector" },
+            };
+          }
+
+          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          if (scope) {
+            if (!context.scopeManager.isAccessible(scope, agentId)) {
+              return {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: { error: "scope_access_denied", requestedScope: scope },
+              };
+            }
+            scopeFilter = [scope];
+          }
+
+          const shouldDryRun = dryRun ?? Boolean(trimmedQuery);
+          const safeLimit = clampInt(limit, 1, 20);
+          let candidates: Array<{ entry: MemoryEntry; score?: number }> = [];
+
+          if (trimmedMemoryId) {
+            const exactMatch = await runtimeContext.store.getById(trimmedMemoryId, scopeFilter);
+            if (exactMatch) {
+              const metadata = parseReflectionMetadata(exactMatch.metadata);
+              if (metadata.type !== "memory-reflection-item") {
+                return {
+                  content: [{ type: "text", text: `Memory ${trimmedMemoryId.slice(0, 8)} is not a reflection item.` }],
+                  details: { error: "not_reflection_item", memoryId: trimmedMemoryId },
+                };
+              }
+              if (metadata.resolvedAt !== undefined) {
+                return {
+                  content: [{ type: "text", text: `Reflection item ${trimmedMemoryId.slice(0, 8)} is already resolved.` }],
+                  details: { error: "already_resolved", memoryId: trimmedMemoryId, resolvedAt: metadata.resolvedAt },
+                };
+              }
+              candidates = [{ entry: exactMatch }];
+            } else {
+              const entries = await runtimeContext.store.list(scopeFilter, "reflection", 1000, 0);
+              const reflectionItemMatches = entries
+                .filter((entry) => entry.id.startsWith(trimmedMemoryId))
+                .filter((entry) => parseReflectionMetadata(entry.metadata).type === "memory-reflection-item");
+              const matches = reflectionItemMatches
+                .filter(isUnresolvedReflectionItem);
+              if (matches.length === 0) {
+                const alreadyResolved = reflectionItemMatches[0];
+                if (alreadyResolved) {
+                  return {
+                    content: [{ type: "text", text: `Reflection item ${trimmedMemoryId.slice(0, 8)} is already resolved.` }],
+                    details: {
+                      error: "already_resolved",
+                      memoryId: trimmedMemoryId,
+                      resolvedAt: parseReflectionMetadata(alreadyResolved.metadata).resolvedAt,
+                    },
+                  };
+                }
+                return {
+                  content: [{ type: "text", text: `Unresolved reflection item ${trimmedMemoryId.slice(0, 8)} not found.` }],
+                  details: { error: "not_found", memoryId: trimmedMemoryId },
+                };
+              }
+              if (matches.length > 1) {
+                return {
+                  content: [{ type: "text", text: `Reflection item prefix ${trimmedMemoryId} is ambiguous; use a longer id.` }],
+                  details: {
+                    error: "ambiguous_memory_id",
+                    memoryId: trimmedMemoryId,
+                    matches: matches.map((entry) => entry.id).slice(0, 20),
+                  },
+                };
+              }
+              candidates = [{ entry: matches[0] }];
+            }
+          } else if (trimmedQuery) {
+            const results = await retrieveWithRetry(runtimeContext.retriever, {
+              query: trimmedQuery,
+              limit: safeLimit,
+              scopeFilter,
+              category: "reflection",
+              source: "cli",
+            }, () => runtimeContext.store.count());
+            candidates = results
+              .filter((result) => isUnresolvedReflectionItem(result.entry))
+              .map((result) => ({ entry: result.entry, score: result.score }));
+            if (candidates.length === 0) {
+              return {
+                content: [{ type: "text", text: "No unresolved reflection items matched." }],
+                details: { action: "empty", query: trimmedQuery, scopeFilter },
+              };
+            }
+          }
+
+          if (shouldDryRun) {
+            return {
+              content: [{ type: "text", text: formatReflectionResolvePreview(candidates) }],
+              details: {
+                action: "preview",
+                query: trimmedQuery,
+                memoryId: trimmedMemoryId,
+                candidates: candidates.map(formatReflectionResolveCandidate),
+              },
+            };
+          }
+
+          if (trimmedQuery && candidates.length !== 1) {
+            return {
+              content: [{
+                type: "text",
+                text: `Query matched ${candidates.length} unresolved reflection items. Preview first, then resolve a specific memoryId.`,
+              }],
+              details: {
+                error: "ambiguous_query",
+                query: trimmedQuery,
+                candidates: candidates.map(formatReflectionResolveCandidate),
+              },
+            };
+          }
+
+          const target = candidates[0]?.entry;
+          if (!target) {
+            return {
+              content: [{ type: "text", text: "No unresolved reflection item selected." }],
+              details: { error: "not_found" },
+            };
+          }
+
+          const patch = {
+            resolvedAt: Date.now(),
+            resolvedBy: agentId,
+            ...(typeof note === "string" && note.trim() ? { resolutionNote: note.trim() } : {}),
+          };
+          const updated = await runtimeContext.store.patchMetadata(target.id, patch, scopeFilter);
+          if (!updated) {
+            return {
+              content: [{ type: "text", text: `Failed to resolve reflection item ${target.id.slice(0, 8)}.` }],
+              details: { error: "resolve_failed", id: target.id },
+            };
+          }
+
+          return {
+            content: [{ type: "text", text: `Resolved reflection item ${target.id.slice(0, 8)}.` }],
+            details: {
+              action: "resolved",
+              id: target.id,
+              resolvedBy: agentId,
+              note: patch.resolutionNote,
+            },
+          };
+        },
+      };
+    },
+    { name: "memory_reflection_resolve" },
+  );
+}
+
 export function registerMemoryCompactTool(
   api: OpenClawPluginApi,
   context: ToolContext,
@@ -2140,12 +3163,16 @@ export function registerMemoryCompactTool(
           scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
           dryRun: Type.Optional(Type.Boolean({ description: "Preview compaction only (default true)." })),
           limit: Type.Optional(Type.Number({ description: "Max entries to scan (default 200)." })),
+          includeInvalidated: Type.Optional(
+            Type.Boolean({ description: "Include invalidated/superseded rows in the scan (default false)." }),
+          ),
         }),
         async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-          const { scope, dryRun = true, limit = 200 } = params as {
+          const { scope, dryRun = true, limit = 200, includeInvalidated = false } = params as {
             scope?: string;
             dryRun?: boolean;
             limit?: number;
+            includeInvalidated?: boolean;
           };
 
           const safeLimit = clampInt(limit, 20, 1000);
@@ -2161,7 +3188,13 @@ export function registerMemoryCompactTool(
             scopeFilter = [scope];
           }
 
-          const entries = await runtimeContext.store.list(scopeFilter, undefined, safeLimit, 0);
+          const entries = await runtimeContext.store.list(
+            scopeFilter,
+            undefined,
+            safeLimit,
+            0,
+            { excludeInactive: !includeInvalidated },
+          );
           const canonicalByKey = new Map<string, typeof entries[number]>();
           const duplicates: Array<{ duplicateId: string; canonicalId: string; key: string }> = [];
 
@@ -2248,16 +3281,9 @@ export function registerMemoryExplainRankTool(
 
           const safeLimit = clampInt(limit, 1, 20);
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
-          if (scope) {
-            if (!context.scopeManager.isAccessible(scope, agentId)) {
-              return {
-                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
-                details: { error: "scope_access_denied", requestedScope: scope },
-              };
-            }
-            scopeFilter = [scope];
-          }
+          const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
+          const { scopeFilter } = resolvedScopes;
+          const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
 
           const results = await retrieveWithRetry(runtimeContext.retriever, {
             query,
@@ -2267,8 +3293,14 @@ export function registerMemoryExplainRankTool(
           }, () => runtimeContext.store.count());
           if (results.length === 0) {
             return {
-              content: [{ type: "text", text: "No relevant memories found." }],
-              details: { action: "empty", query, scopeFilter },
+              content: [{ type: "text", text: [ignoredScopeNotice, "No relevant memories found."].filter(Boolean).join("\n") }],
+              details: {
+                action: "empty",
+                query,
+                scopeFilter,
+                ignoredScope: resolvedScopes.ignoredScope,
+                accessibleScopes: resolvedScopes.accessibleScopes,
+              },
             };
           }
 
@@ -2278,6 +3310,7 @@ export function registerMemoryExplainRankTool(
             if (r.sources.vector) sourceBreakdown.push(`vec=${r.sources.vector.score.toFixed(3)}`);
             if (r.sources.bm25) sourceBreakdown.push(`bm25=${r.sources.bm25.score.toFixed(3)}`);
             if (r.sources.reranked) sourceBreakdown.push(`rerank=${r.sources.reranked.score.toFixed(3)}`);
+            if (r.neighbors && r.neighbors.length > 0) sourceBreakdown.push(`neighbors=${r.neighbors.length}`);
             return [
               `${idx + 1}. [${r.entry.id}] score=${r.score.toFixed(3)} ${sourceBreakdown.join(" ")}`.trim(),
               `   state=${meta.state} layer=${meta.memory_layer} source=${meta.source} tier=${meta.tier}`,
@@ -2287,11 +3320,13 @@ export function registerMemoryExplainRankTool(
           });
 
           return {
-            content: [{ type: "text", text: lines.join("\n") }],
+            content: [{ type: "text", text: [ignoredScopeNotice, lines.join("\n")].filter(Boolean).join("\n") }],
             details: {
               action: "explain_rank",
               query,
               count: results.length,
+              ignoredScope: resolvedScopes.ignoredScope,
+              accessibleScopes: resolvedScopes.accessibleScopes,
               results: sanitizeMemoryForSerialization(results),
             },
           };
@@ -2316,6 +3351,9 @@ export function registerAllMemoryTools(
 ) {
   // Core tools (always enabled)
   registerMemoryRecallTool(api, context);
+  registerMemoryRecallAliasTool(api, context, "memory_search");
+  registerMemoryRecallAliasTool(api, context, "memory_get");
+  registerMemoryFactQueryTool(api, context);
   registerMemoryStoreTool(api, context);
   registerMemoryForgetTool(api, context);
   registerMemoryUpdateTool(api, context);
@@ -2327,6 +3365,7 @@ export function registerAllMemoryTools(
     registerMemoryListTool(api, context);
     registerMemoryPromoteTool(api, context);
     registerMemoryArchiveTool(api, context);
+    registerMemoryReflectionResolveTool(api, context);
     registerMemoryCompactTool(api, context);
     registerMemoryExplainRankTool(api, context);
   }

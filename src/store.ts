@@ -12,9 +12,7 @@ import {
   mkdirSync,
   realpathSync,
   lstatSync,
-  statSync,
   unlinkSync,
-  rmdirSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -22,16 +20,27 @@ import {
   lstat as lstatAsync,
   mkdir as mkdirAsync,
   realpath as realpathAsync,
+  rmdir as rmdirAsync,
+  stat as statAsync,
+  unlink as unlinkAsync,
+  writeFile as writeFileAsync,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
 import {
-  buildSmartMetadata,
-  isMemoryVisibleInMode,
-  parseSmartMetadata,
-  stringifySmartMetadata,
-  type MemoryRecallMode,
-} from "./smart-metadata.js";
+  drainManualRecallMetadata,
+  ManualRecallMetadataBatchSettledError,
+} from "./manual-recall-metadata-queue.js";
+import {
+  RedisLockAcquisitionError,
+  RedisLockLeaseIntegrityError,
+  RedisLockManager,
+  RedisLockUnavailableError,
+  type RedisLockConfig,
+} from "./redis-lock.js";
+import { buildSmartMetadata, isMemoryActiveAt, isMemoryVisibleInMode, parseSmartMetadata, stringifySmartMetadata, type MemoryRecallMode } from "./smart-metadata.js";
+import { LEGACY_FTS_COLUMN, SEARCH_TEXT_COLUMN, buildSearchText } from "./search-text.js";
 
 // ============================================================================
 // Types
@@ -46,6 +55,7 @@ export interface MemoryEntry extends Record<string, unknown> {
   importance: number;
   timestamp: number;
   metadata?: string; // JSON string for extensible metadata
+  search_text?: string; // BM25 source: abstract + summary layers, recomputed at every write
 }
 
 export interface MemorySearchResult {
@@ -65,11 +75,64 @@ export interface StoreConfig {
   vectorDim: number;
   /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
   disableNativeCosine?: boolean;
+  /**
+   * Seconds between checks for table updates committed by other processes
+   * (e.g. a separate CLI invocation deleting rows while a gateway process
+   * holds a long-lived read handle). Unset: no check, matches the LanceDB
+   * SDK default. 0: strong consistency, every read checks for updates.
+   * >0: eventual consistency, bounded staleness of that many seconds.
+   */
+  readConsistencyInterval?: number;
+  redisLock?: RedisLockConfig;
   onStoragePathWarning?: (message: string) => void;
+  onLockWarning?: (message: string) => void;
+}
+
+export interface StorageMaintenanceResult {
+  retentionDays: number;
+  cleanupOlderThan: string;
+  stats: unknown;
 }
 
 export interface MetadataPatch {
   [key: string]: unknown;
+}
+
+export interface MemoryUpdatePatch {
+  text?: string;
+  vector?: number[];
+  importance?: number;
+  category?: MemoryEntry["category"];
+  metadata?: string;
+}
+
+export interface MemoryBulkUpdateResult {
+  id: string;
+  entry: MemoryEntry | null;
+  error?: string;
+  retryable?: boolean;
+}
+
+export interface ManualRecallMetadataUpdate {
+  id: string;
+  expectedScope: string;
+  accessCountDelta: number;
+  accessedAt: number;
+  governanceSnapshot: {
+    badRecallCount: number;
+    suppressedUntilTurn: number;
+    suppressedUntilMs?: number;
+  };
+}
+
+export interface ImportEntryOptions {
+  /**
+   * Treat the entry as known-legacy data (v1.x 1-5 integer importance scale)
+   * and apply `normalizeLegacyImportance` once at this explicit legacy-
+   * provenance boundary. Defaults to false — generic v2+ imports use
+   * `clampImportance` to preserve 0, 1, and decimal values.
+   */
+  legacy?: boolean;
 }
 
 // ============================================================================
@@ -102,6 +165,20 @@ export const loadLanceDB = async (): Promise<
   typeof import("@lancedb/lancedb")
 > => {
   if (!lancedbImportPromise) {
+    // @lancedb/lancedb's napi-rs loader (dist/native.js) detects musl via
+    // process.report.getReport(). The report's network section performs
+    // reverse-DNS lookups for every network interface, synchronously on the
+    // calling thread; on hosts with several interfaces and a slow or flaky
+    // DNS path (measured on WSL2 + Tailscale) this blocks the event loop for
+    // 110-250s on the FIRST LanceDB load — the host app's HTTP server and
+    // pollers freeze with CPU at 0% (main thread stuck in poll()). Excluding
+    // the network section turns the measured 235s hang into ~3ms and loses
+    // nothing: isMusl() only reads report.header.glibcVersionRuntime.
+    try {
+      (process.report as { excludeNetwork?: boolean }).excludeNetwork = true;
+    } catch {
+      /* Node < 22 without the flag — keep the previous behavior */
+    }
     // Use a createRequire-built require() so LanceDB's CommonJS native bindings
     // keep Windows-safe CJS semantics while still working in pure ESM runtimes.
     // Do not name this binding "require": bundlers may rewrite bare require()
@@ -129,14 +206,32 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
+const LEGACY_STABLE_MEMORY_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$/;
 const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
+
+function isLegacyStableMemoryId(id: string): boolean {
+  return LEGACY_STABLE_MEMORY_ID_REGEX.test(id);
+}
+
+const MAX_SAFE_TIMESTAMP_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()): number {
   const raw = value instanceof Date
     ? value.getTime()
-    : typeof value === "number"
-      ? value
-      : Number(value);
+    : typeof value === "bigint"
+      // LanceDB returns int64 columns as BigInt. Convert inside the safe-integer
+      // bound so out-of-range values clamp deterministically instead of silently
+      // losing precision through Number()'s float rounding.
+      ? Number(
+          value > MAX_SAFE_TIMESTAMP_BIGINT
+            ? MAX_SAFE_TIMESTAMP_BIGINT
+            : value < 0n
+              ? 0n
+              : value,
+        )
+      : typeof value === "number"
+        ? value
+        : Number(value);
 
   if (!Number.isFinite(raw) || raw <= 0) {
     return fallback;
@@ -144,6 +239,57 @@ export function normalizeMemoryTimestamp(value: unknown, fallback = Date.now()):
 
   const timestamp = Math.floor(raw);
   return timestamp < LEGACY_SECONDS_TIMESTAMP_MAX ? timestamp * 1000 : timestamp;
+}
+
+/**
+ * Normalize legacy v1.x importance scale (1-5 integers) to v2+ scale (0~1 floats)
+ *
+ * Mapping:
+ *   1 → 0.20   2 → 0.40   3 → 0.60   4 → 0.80   5 → 0.95
+ *
+ * Values already in 0~1 range pass through unchanged.
+ * Use ONLY where the data is known to be legacy (migrate / importEntry / backfill).
+ * For generic v2+ read paths, use clampImportance instead to avoid double-normalization
+ * corruption (e.g. 99 -> 1.0 -> 0.20).
+ *
+ * NOTE: 1.0 is indistinguishable from legacy integer 1 in JS (Number.isInteger(1.0) === true),
+ * so legacy-v1 callers must be aware that legitimate 1.0 will map to 0.20. This trade-off is
+ * only safe in legacy import contexts; v2+ data flows through clampImportance.
+ */
+export function normalizeLegacyImportance(value: number): number {
+  // Guard against NaN / Infinity / -Infinity from corrupted data
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.7;
+
+  // Legacy v1.x integer scale (1-5) → v2+ 0~1
+  if (Number.isInteger(value) && value >= 1 && value <= 5) {
+    return [null, 0.20, 0.40, 0.60, 0.80, 0.95][value];
+  }
+
+  // Non-legacy float (incl. v2+ 0~1) — pass through with clamp as defensive bound
+  return Math.max(0.0, Math.min(1.0, value));
+}
+
+/**
+ * Clamp a value to the v2+ 0~1 range, preserving legitimate v2+ values like 1.0.
+ * Use on ALL read paths (search, list, getById, update, etc.) to avoid
+ * double-normalization corruption.
+ *
+ * Idempotent: clampImportance(clampImportance(x)) === clampImportance(x).
+ */
+export function clampImportance(value: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.7;
+  return Math.max(0.0, Math.min(1.0, value));
+}
+
+/**
+ * @deprecated Use normalizeLegacyImportance (for legacy data) or clampImportance
+ * (for v2+ data) based on data provenance. This wrapper is kept for backward
+ * compatibility and routes to clampImportance (v2+ 0~1 semantics). The previous
+ * behavior routed to legacy normalization, which surprised callers expecting
+ * generic v2 clamp semantics (see PR #828 review).
+ */
+export function normalizeImportance(value: number): number {
+  return clampImportance(value);
 }
 
 function normalizePredicateTimestamp(value: unknown): number | null {
@@ -229,15 +375,53 @@ function normalizeSearchText(value: string): string {
   return value.toLowerCase().trim();
 }
 
+function hasValidEntryScope(scope: unknown): scope is string {
+  return typeof scope === "string" && scope.trim().length > 0;
+}
+
 function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
 
+// A NULL/undefined row scope must never be treated as if it were literally
+// "global" for ACL purposes: list/vectorSearch/bm25Search/stats/fetchForCompaction
+// all deny a NULL-scope row against any real scope filter (no more "OR scope IS
+// NULL"), so ID-based lookups must apply the same deny-by-default rule against
+// the row's real (uncoerced) scope, not a display-only "global" fallback that a
+// filter containing "global" would spuriously match.
+function isRowScopeAccessible(realScope: string | null | undefined, scopeFilter?: string[]): boolean {
+  if (!scopeFilter || scopeFilter.length === 0) return true;
+  if (!realScope) return false;
+  return scopeFilter.includes(realScope);
+}
+
+function ftsIndexColumn(idx: unknown): string | null {
+  const candidate = idx as { indexType?: unknown; columns?: unknown } | null | undefined;
+  const columns = Array.isArray(candidate?.columns) ? candidate.columns.map(String) : [];
+  if (columns.includes(SEARCH_TEXT_COLUMN)) return SEARCH_TEXT_COLUMN;
+  if (columns.includes(LEGACY_FTS_COLUMN)) return LEGACY_FTS_COLUMN;
+  if (candidate?.indexType === "FTS") return columns[0] ?? LEGACY_FTS_COLUMN;
+  return null;
+}
+
+function isFtsIndex(idx: unknown): boolean {
+  return ftsIndexColumn(idx) !== null;
+}
+
+function ftsIndexName(idx: unknown): string {
+  const name = (idx as { name?: unknown } | null | undefined)?.name;
+  return typeof name === "string" && name ? name : `${ftsIndexColumn(idx) ?? LEGACY_FTS_COLUMN}_idx`;
+}
+
 function hasFtsIndex(indices: unknown): boolean {
-  return Array.isArray(indices) && indices.some((idx: any) =>
-    idx?.indexType === "FTS" ||
-    (Array.isArray(idx?.columns) && idx.columns.includes("text")),
-  );
+  return Array.isArray(indices) && indices.some(isFtsIndex);
+}
+
+function preferredFtsColumn(indices: unknown): string | null {
+  if (!Array.isArray(indices)) return null;
+  const columns = indices.map(ftsIndexColumn).filter((column): column is string => column !== null);
+  if (columns.includes(SEARCH_TEXT_COLUMN)) return SEARCH_TEXT_COLUMN;
+  return columns[0] ?? null;
 }
 
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
@@ -478,7 +662,10 @@ export class MemoryStore {
   private ftsIndexCreated = false;
   private _lastFtsError: string | null = null;
   private updateQueue: Promise<void> = Promise.resolve();
+  private writeLockQueue: Promise<void> = Promise.resolve();
   private nativeCosineFallbackLogged = false;
+  private dataModsSinceIndexFold = 0;
+  private indexFoldInFlight = false;
 
   // Cross-call batch accumulator（Issue #690）
   // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
@@ -506,9 +693,16 @@ export class MemoryStore {
   // 【MR2 fix】pendingBatch 上限，防止高生產率時無限增長。
   // 當 pending callers 超過此值時，block 並同步 flush，確保 pendingBatch 不會無限膨胀。
   private static readonly MAX_PENDING_BATCH_SIZE = 1000;
+  // LanceDB indices are point-in-time snapshots; the SDK recommends running
+  // optimize() after ~20 data modification operations so indices fold in
+  // newly written rows instead of leaving them in the brute-force-scanned tail.
+  private static readonly INDEX_FOLD_OP_THRESHOLD = 20;
+  private ftsColumn: string = SEARCH_TEXT_COLUMN;
+  private searchTextColumnReady = false;
 
   private readonly config: StoreConfig;
   private readonly disableNativeCosine: boolean;
+  private redisLock: RedisLockManager | null = null;
 
   constructor(config: StoreConfig) {
     const envDisablesNativeCosine = parseBooleanEnvFlag(process.env.MEMORY_LANCEDB_DISABLE_NATIVE_COSINE);
@@ -517,6 +711,12 @@ export class MemoryStore {
       dbPath: normalizeStoragePath(config.dbPath),
     };
     this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
+    if (config.redisLock?.enabled === true) {
+      this.redisLock = new RedisLockManager({
+        ...config.redisLock,
+        onWarning: config.onLockWarning,
+      });
+    }
   }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -524,10 +724,13 @@ export class MemoryStore {
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
     const lockArtifactPath = `${lockPath}.lock`;
     const ensureLockTargetExists = async () => {
-      if (!existsSync(lockPath)) {
-        try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-        try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
-      }
+      try {
+        await accessAsync(lockPath);
+        return;
+      } catch {}
+
+      try { await mkdirAsync(dirname(lockPath), { recursive: true }); } catch {}
+      try { await writeFileAsync(lockPath, "", { flag: "wx" }); } catch {}
     };
     await ensureLockTargetExists();
     // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
@@ -541,23 +744,21 @@ export class MemoryStore {
     // Proactive cleanup of stale proper-lockfile artifacts（from PR #626）.
     // proper-lockfile locks the target by creating `${target}.lock`; the
     // target file itself is expected to persist and must not be treated stale.
-    if (existsSync(lockArtifactPath)) {
-      try {
-        const stat = statSync(lockArtifactPath);
-        const ageMs = Date.now() - stat.mtimeMs;
-        const staleThresholdMs = 5 * 60 * 1000;
-        if (ageMs > staleThresholdMs) {
-          try {
-            if (stat.isDirectory()) {
-              rmdirSync(lockArtifactPath);
-            } else {
-              unlinkSync(lockArtifactPath);
-            }
-            console.warn(`[memory-lancedb-pro] cleared stale lock artifact: ${lockArtifactPath} ageMs=${ageMs}`);
-          } catch {}
-        }
-      } catch {}
-    }
+    try {
+      const stat = await statAsync(lockArtifactPath);
+      const ageMs = Date.now() - stat.mtimeMs;
+      const staleThresholdMs = 5 * 60 * 1000;
+      if (ageMs > staleThresholdMs) {
+        try {
+          if (stat.isDirectory()) {
+            await rmdirAsync(lockArtifactPath);
+          } else {
+            await unlinkAsync(lockArtifactPath);
+          }
+          console.warn(`[memory-lancedb-pro] cleared stale lock artifact: ${lockArtifactPath} ageMs=${ageMs}`);
+        } catch {}
+      }
+    } catch {}
 
     const acquireLock = async () => lockfile.lock(lockPath, {
       // 【修復 #670】realpath:false — 避免 proactive cleanup 刪除 stale lock artifact 後，
@@ -635,11 +836,137 @@ export class MemoryStore {
     }
   }
 
+  private async runWithWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+    // Serialize same-instance acquisitions before contending on the shared lock.
+    // Otherwise a later caller can acquire the file/Redis lock first and reorder
+    // writes, while the inner update queue cannot restore the original order.
+    const previous = this.writeLockQueue;
+    let releaseQueue!: () => void;
+    this.writeLockQueue = new Promise<void>((resolve) => { releaseQueue = resolve; });
+    await previous;
+    try {
+      return this.redisLock
+        ? await this.redisLock.withLock(this.config.dbPath, fn)
+        : await this.runWithFileLock(fn);
+    } finally {
+      releaseQueue();
+    }
+  }
+
+  private async closeLockResources(): Promise<void> {
+    if (!this.redisLock) return;
+    try {
+      await this.redisLock.close();
+    } catch (err) {
+      this.config.onLockWarning?.(
+        `memory-lancedb-pro: failed to close Redis lock client: ${String(err)}`,
+      );
+    }
+  }
+
   get dbPath(): string {
     return this.config.dbPath;
   }
 
-  private async ensureInitialized(): Promise<void> {
+  get readConsistencyInterval(): number | undefined {
+    return this.config.readConsistencyInterval;
+  }
+
+  async runStorageMaintenance(retentionDays = 7): Promise<StorageMaintenanceResult> {
+    if (this.destroyed) {
+      throw new Error("MemoryStore instance has been destroyed");
+    }
+
+    await this.ensureInitialized();
+
+    const safeRetentionDays = clampInt(retentionDays, 1, 3650);
+    const cleanupOlderThan = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
+
+    return this.runWithWriteLock(async () => {
+      if (!this.table || typeof this.table.optimize !== "function") {
+        throw new Error("LanceDB table.optimize() is not available in this runtime");
+      }
+
+      const stats = await this.table.optimize({ cleanupOlderThan });
+      return {
+        retentionDays: safeRetentionDays,
+        cleanupOlderThan: cleanupOlderThan.toISOString(),
+        stats,
+      };
+    });
+  }
+
+  /**
+   * Fold newly written rows into existing indices without touching version
+   * history. LanceDB indices are point-in-time snapshots: rows added after
+   * index creation sit in an unindexed tail that searches must brute-force
+   * scan, so without periodic optimize() the FTS index never covers rows
+   * written after first init. The epoch cleanupOlderThan cutoff makes the
+   * prune step a no-op; version retention stays under the opt-in
+   * storageMaintenance.autoCleanup path (see runStorageMaintenance).
+   */
+  private async foldIndices(reason: string): Promise<void> {
+    if (this.indexFoldInFlight || !this.table || typeof this.table.optimize !== "function") {
+      return;
+    }
+    this.indexFoldInFlight = true;
+    const mods = this.dataModsSinceIndexFold;
+    this.dataModsSinceIndexFold = 0;
+    try {
+      await this.runWithWriteLock(async () => {
+        await this.table!.optimize({ cleanupOlderThan: new Date(0) });
+      });
+      console.log(
+        `[memory-lancedb-pro] index fold completed (reason=${reason}, modsSinceLast=${mods})`,
+      );
+    } catch (err) {
+      // Re-arm the counter so a transient failure retries on later writes.
+      this.dataModsSinceIndexFold += mods;
+      console.warn(
+        `[memory-lancedb-pro] index fold failed (reason=${reason}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      this.indexFoldInFlight = false;
+    }
+  }
+
+  private noteDataModification(): void {
+    this.dataModsSinceIndexFold += 1;
+    if (this.dataModsSinceIndexFold >= MemoryStore.INDEX_FOLD_OP_THRESHOLD) {
+      void this.foldIndices("write-threshold");
+    }
+  }
+
+  private async checkoutLatestTableForWrite(): Promise<void> {
+    const table = this.table as (LanceDB.Table & { checkoutLatest?: () => Promise<void> }) | null;
+    if (typeof table?.checkoutLatest === "function") {
+      await table.checkoutLatest();
+    }
+  }
+
+  private async scheduleStartupIndexCatchUp(): Promise<void> {
+    try {
+      const table = this.table;
+      if (!table || typeof table.indexStats !== "function") return;
+      const indices = await table.listIndices();
+      const fts = indices.find(isFtsIndex);
+      if (!fts) return;
+      const stats = await table.indexStats(ftsIndexName(fts));
+      const backlog = stats?.numUnindexedRows ?? 0;
+      if (backlog >= MemoryStore.INDEX_FOLD_OP_THRESHOLD) {
+        console.log(
+          `[memory-lancedb-pro] FTS index has ${backlog} unindexed rows; scheduling catch-up fold`,
+        );
+        void this.foldIndices("startup-backlog");
+      }
+    } catch {
+      // Index stats are best-effort; failures must never affect initialization.
+    }
+  }
+
+  /** Public so callers can warm the one-time table open / FTS index build
+   *  outside latency-sensitive windows (startup health probes do this). */
+  async ensureInitialized(): Promise<void> {
     if (this.table) {
       return;
     }
@@ -668,7 +995,9 @@ export class MemoryStore {
 
     let db: LanceDB.Connection;
     try {
-      db = await lancedb.connect(this.config.dbPath);
+      db = await lancedb.connect(this.config.dbPath, {
+        readConsistencyInterval: this.config.readConsistencyInterval,
+      });
     } catch (err: any) {
       const code = err.code || "";
       const message = err.message || String(err);
@@ -678,76 +1007,8 @@ export class MemoryStore {
       );
     }
 
-    let table: LanceDB.Table;
-
-    // Idempotent table init: try openTable first, create only if missing,
-    // and handle the race where tableNames() misses an existing table but
-    // createTable then sees it (LanceDB eventual consistency).
-    try {
-      table = await db.openTable(TABLE_NAME);
-
-      // Migrate legacy tables: add missing columns for backward compatibility
-      try {
-        const schema = await table.schema();
-        const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
-
-        const missingColumns: Array<{ name: string; valueSql: string }> = [];
-        if (!fieldNames.has("scope")) {
-          missingColumns.push({ name: "scope", valueSql: "'global'" });
-        }
-        if (!fieldNames.has("timestamp")) {
-          missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
-        }
-        if (!fieldNames.has("metadata")) {
-          missingColumns.push({ name: "metadata", valueSql: "'{}'" });
-        }
-
-        if (missingColumns.length > 0) {
-          console.warn(
-            `memory-lancedb-pro: migrating legacy table — adding columns: ${missingColumns.map((c) => c.name).join(", ")}`,
-          );
-          await table.addColumns(missingColumns);
-          console.log(
-            `memory-lancedb-pro: migration complete — ${missingColumns.length} column(s) added`,
-          );
-        }
-      } catch (err) {
-        const msg = String(err);
-        if (msg.includes("already exists")) {
-          // Concurrent initialization race — another process already added the columns
-          console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
-        } else {
-          console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
-        }
-      }
-    } catch (_openErr) {
-      // Table doesn't exist yet — create it
-      const schemaEntry: MemoryEntry = {
-        id: "__schema__",
-        text: "",
-        vector: Array.from({ length: this.config.vectorDim }).fill(
-          0,
-        ) as number[],
-        category: "other",
-        scope: "global",
-        importance: 0,
-        timestamp: 0,
-        metadata: "{}",
-      };
-
-      try {
-        table = await db.createTable(TABLE_NAME, [schemaEntry]);
-        await table.delete('id = "__schema__"');
-      } catch (createErr) {
-        // Race: another caller (or eventual consistency) created the table
-        // between our failed openTable and this createTable — just open it.
-        if (String(createErr).includes("already exists")) {
-          table = await db.openTable(TABLE_NAME);
-        } else {
-          throw createErr;
-        }
-      }
-    }
+    const table = await this.openOrCreateMemoryTable(db);
+    this.searchTextColumnReady = await this.tableHasSearchTextColumn(table);
 
     await this.backfillLegacySecondTimestamps(table);
 
@@ -766,7 +1027,7 @@ export class MemoryStore {
 
     // Create FTS index for BM25 search (graceful fallback if unavailable)
     try {
-      await this.createFtsIndex(table);
+      await this.createFtsIndexWithWriteLock(table);
       this.ftsIndexCreated = true;
       this._lastFtsError = null;
     } catch (err) {
@@ -780,13 +1041,140 @@ export class MemoryStore {
 
     this.db = db;
     this.table = table;
+
+    // Fold any unindexed backlog accumulated while no maintenance ran
+    // (best-effort, runs in the background, never blocks initialization).
+    void this.scheduleStartupIndexCatchUp();
+  }
+
+  private isRedisLockCoordinationError(err: unknown): boolean {
+    return err instanceof RedisLockUnavailableError ||
+      err instanceof RedisLockAcquisitionError ||
+      err instanceof RedisLockLeaseIntegrityError;
+  }
+
+  private getMissingLegacyColumns(fieldNames: Set<string>): Array<{ name: string; valueSql: string }> {
+    const missingColumns: Array<{ name: string; valueSql: string }> = [];
+    if (!fieldNames.has("scope")) {
+      missingColumns.push({ name: "scope", valueSql: "'global'" });
+    }
+    if (!fieldNames.has("timestamp")) {
+      missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
+    }
+    if (!fieldNames.has("metadata")) {
+      missingColumns.push({ name: "metadata", valueSql: "'{}'" });
+    }
+    if (!fieldNames.has(SEARCH_TEXT_COLUMN)) {
+      // Seeded with the abstract so BM25 keeps answering until the backfill
+      // below folds the summary layers in.
+      missingColumns.push({ name: SEARCH_TEXT_COLUMN, valueSql: LEGACY_FTS_COLUMN });
+    }
+    return missingColumns;
+  }
+
+  private async readMissingLegacyColumns(table: LanceDB.Table): Promise<Array<{ name: string; valueSql: string }>> {
+    const schema = await table.schema();
+    const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
+    return this.getMissingLegacyColumns(fieldNames);
+  }
+
+  private async migrateLegacyTableColumns(table: LanceDB.Table, alreadyLocked = false): Promise<void> {
+    try {
+      const missingColumns = await this.readMissingLegacyColumns(table);
+      if (missingColumns.length === 0) return;
+
+      const applyMigration = async () => {
+        const currentMissingColumns = await this.readMissingLegacyColumns(table);
+        if (currentMissingColumns.length === 0) return;
+
+        console.warn(
+          `memory-lancedb-pro: migrating legacy table — adding columns: ${currentMissingColumns.map((c) => c.name).join(", ")}`,
+        );
+        await table.addColumns(currentMissingColumns);
+        console.log(
+          `memory-lancedb-pro: migration complete — ${currentMissingColumns.length} column(s) added`,
+        );
+        if (currentMissingColumns.some((column) => column.name === SEARCH_TEXT_COLUMN)) {
+          const backfill = await this.backfillSearchTextRows(table);
+          console.log(
+            `memory-lancedb-pro: ${SEARCH_TEXT_COLUMN} backfill — ${backfill.updated} of ${backfill.scanned} row(s) rewritten from their summary layers`,
+          );
+        }
+      };
+
+      if (alreadyLocked) {
+        await applyMigration();
+      } else {
+        await this.runWithWriteLock(applyMigration);
+      }
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("already exists")) {
+        // Concurrent initialization race — another process already added the columns
+        console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
+      } else if (this.isRedisLockCoordinationError(err)) {
+        throw err;
+      } else {
+        console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
+      }
+    }
+  }
+
+  private async openOrCreateMemoryTable(db: LanceDB.Connection): Promise<LanceDB.Table> {
+    // Idempotent table init: try openTable first, create only if missing,
+    // and handle the race where tableNames() misses an existing table but
+    // createTable then sees it (LanceDB eventual consistency).
+    let table: LanceDB.Table;
+    try {
+      table = await db.openTable(TABLE_NAME);
+    } catch (_openErr) {
+      return this.runWithWriteLock(async () => {
+        let lockedTable: LanceDB.Table;
+        try {
+          lockedTable = await db.openTable(TABLE_NAME);
+        } catch {
+          // Table doesn't exist yet — create it
+          const schemaEntry: MemoryEntry = {
+            id: "__schema__",
+            text: "",
+            vector: Array.from({ length: this.config.vectorDim }).fill(
+              0,
+            ) as number[],
+            category: "other",
+            scope: "global",
+            importance: 0,
+            timestamp: 0,
+            metadata: "{}",
+            search_text: "",
+          };
+
+          try {
+            lockedTable = await db.createTable(TABLE_NAME, [schemaEntry]);
+            await lockedTable.delete('id = "__schema__"');
+          } catch (createErr) {
+            // Race: another caller (or eventual consistency) created the table
+            // between our failed openTable and this createTable — just open it.
+            if (String(createErr).includes("already exists")) {
+              lockedTable = await db.openTable(TABLE_NAME);
+            } else {
+              throw createErr;
+            }
+          }
+        }
+        await this.migrateLegacyTableColumns(lockedTable, true);
+        return lockedTable;
+      });
+    }
+
+    await this.migrateLegacyTableColumns(table);
+    return table;
   }
 
   private async backfillLegacySecondTimestamps(table: LanceDB.Table): Promise<void> {
     try {
       let normalizedCount = 0;
 
-      await this.runWithFileLock(async () => {
+      await this.runWithWriteLock(async () => {
         const candidateRows = await table.query()
           .where(
             `(timestamp > 0 AND timestamp < ${LEGACY_SECONDS_TIMESTAMP_MAX}) OR ` +
@@ -807,7 +1195,11 @@ export class MemoryStore {
           const originalRow = {
             ...row,
             vector: Array.from(row.vector as Iterable<number>),
-            scope: (row.scope as string | undefined) ?? "global",
+            // Deliberately NOT coercing a NULL/undefined scope to "global" here: this
+            // delete+re-add cycle exists purely to normalize legacy timestamps and must
+            // not have the side effect of silently promoting a NULL-scope row into the
+            // real "global" scope (which would defeat the deny-by-default ACL rule that
+            // list/vectorSearch/getById/etc. apply to genuinely scopeless rows).
             metadata: (row.metadata as string | undefined) || "{}",
           };
           const normalizedRow = {
@@ -895,21 +1287,33 @@ export class MemoryStore {
 
   private async createFtsIndex(table: LanceDB.Table): Promise<void> {
     try {
-      // Check if FTS index already exists
       const indices = await table.listIndices();
-
-      if (!hasFtsIndex(indices)) {
-        // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
-        const lancedb = await loadLanceDB();
-        await table.createIndex("text", {
-          config: (lancedb as any).Index.fts({ withPosition: true }),
-        });
+      const column = (await this.tableHasSearchTextColumn(table)) ? SEARCH_TEXT_COLUMN : LEGACY_FTS_COLUMN;
+      const existing = indices.filter(isFtsIndex);
+      if (existing.some((idx) => ftsIndexColumn(idx) === column)) {
+        this.ftsColumn = column;
+        return;
       }
+      // An index left on the abstract column would make a bare FTS query
+      // ambiguous once the search_text index exists; the move replaces it.
+      for (const idx of existing) {
+        await table.dropIndex(ftsIndexName(idx));
+      }
+      // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
+      const lancedb = await loadLanceDB();
+      await table.createIndex(column, {
+        config: (lancedb as any).Index.fts({ withPosition: true }),
+      });
+      this.ftsColumn = column;
     } catch (err) {
       throw new Error(
         `FTS index creation failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  private async createFtsIndexWithWriteLock(table: LanceDB.Table): Promise<void> {
+    await this.runWithWriteLock(() => this.createFtsIndex(table));
   }
 
   async store(
@@ -918,23 +1322,57 @@ export class MemoryStore {
     // F1 fix: store() now routes through bulkStore() accumulator
     // for consistent lock contention behavior (no per-call file lock).
     // MR2 fix: when pendingBatch is empty, immediate flush avoids 100ms delay.
-    const results = await this.bulkStore([entry]);
+    // F3 fix (PR #828 follow-up): clamp importance at the write boundary so
+    // direct store() callers (e.g. the CLI JSON no-id import path) cannot
+    // persist out-of-range raw values like 4 or 99. clampImportance is
+    // idempotent and preserves legitimate v2+ 0~1 values, so wrapping here is
+    // safe for callers that already normalized upstream. importEntry() keeps
+    // its explicit legacy branch — this clamp is the generic v2+ boundary.
+    // Number() coerces the structurally-typed entry.importance to a real
+    // number so clampImportance's NaN/Infinity fallback can do its job.
+    if (!hasValidEntryScope(entry.scope)) {
+      throw new Error(
+        "store() requires a non-empty scope: scope-less rows are invisible to scoped readers",
+      );
+    }
+    const clampedEntry: Omit<MemoryEntry, "id" | "timestamp"> = {
+      ...entry,
+      importance: clampImportance(Number(entry.importance)),
+    };
+    const results = await this.bulkStore([clampedEntry]);
     return results[0];
   }
 
   async upsert(entry: MemoryEntry): Promise<MemoryEntry> {
+    if (!hasValidEntryScope(entry.scope)) {
+      throw new Error(
+        `upsert() requires a non-empty scope: refusing to delete row ${entry.id} for a scope-less replacement`,
+      );
+    }
+    // Canonicalize scope whitespace before the destructive replace (same
+    // write-boundary contract as bulkStore): a validated-but-padded scope
+    // would delete the canonical row and persist a replacement invisible to
+    // its own scope filter.
+    const canonicalScope = entry.scope.trim();
     await this.ensureInitialized();
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
       const safeId = escapeSqlLiteral(entry.id);
       await this.table!.delete(`id = '${safeId}'`).catch(() => undefined);
+      // F3 fix (PR #828 follow-up): clamp importance at the write boundary so
+      // upsert() callers cannot persist out-of-range raw values. clampImportance
+      // is idempotent and preserves legitimate v2+ 0~1 values.
       const normalizedEntry: MemoryEntry = {
         ...entry,
+        scope: canonicalScope,
         metadata: entry.metadata || "{}",
+        importance: clampImportance(entry.importance),
       };
-      await this.table!.add([normalizedEntry]);
+      await this.table!.add([this.toRow(normalizedEntry)]);
       return normalizedEntry;
     }));
+    this.noteDataModification();
+    return result;
   }
 
   /**
@@ -959,6 +1397,7 @@ export class MemoryStore {
    */
   async bulkStore(
     entries: Omit<MemoryEntry, "id" | "timestamp">[],
+    onInvalidEntry?: (report: { index: number; reason: string }) => void,
   ): Promise<MemoryEntry[]> {
     // 【MR4 fix】阻止 destroy() 後的呼叫
     if (this.destroyed) {
@@ -967,15 +1406,25 @@ export class MemoryStore {
     await this.ensureInitialized();
 
     // Filter out invalid entries（undefined, null, missing text/vector）
-    const validEntries = entries.filter((entry) => {
-      const candidate = entry as { text?: unknown; vector?: unknown };
-      return (
-        !!candidate &&
-        typeof candidate.text === "string" &&
-        candidate.text.length > 0 &&
-        Array.isArray(candidate.vector) &&
-        candidate.vector.length > 0
-      );
+    // Scope is part of the write contract: scope-less rows are invisible to
+    // the hardened scoped readers, so silently persisting them is data loss.
+    const validEntries: Omit<MemoryEntry, "id" | "timestamp">[] = [];
+    entries.forEach((entry, index) => {
+      const candidate = entry as { text?: unknown; vector?: unknown; scope?: unknown } | null | undefined;
+      const reason = !candidate
+        ? "entry is null or undefined"
+        : typeof candidate.text !== "string" || candidate.text.length === 0
+          ? "missing or empty text"
+          : !Array.isArray(candidate.vector) || candidate.vector.length === 0
+            ? "missing or empty vector"
+            : !hasValidEntryScope(candidate.scope)
+              ? "missing or blank scope"
+              : null;
+      if (reason != null) {
+        onInvalidEntry?.({ index, reason });
+        return;
+      }
+      validEntries.push(entry);
     });
 
     // Early return for empty array（skip accumulation）
@@ -984,11 +1433,23 @@ export class MemoryStore {
     }
 
     // 附加 id/timestamp
+    // F3 fix (PR #828 follow-up): clamp importance at the bulk write boundary
+    // so direct bulkStore() callers cannot persist out-of-range raw values like
+    // 4 or 99. clampImportance is idempotent, so callers that already
+    // normalized upstream are unaffected. store() applies the same clamp
+    // before calling bulkStore(); doing it again here covers direct bulkStore
+    // callers (e.g. CLI JSON import retry paths).
+    // Number() coerces the structurally-typed entry.importance to a real
+    // number so clampImportance's NaN/Infinity fallback can do its job.
     const fullEntries: MemoryEntry[] = validEntries.map((entry) => ({
       ...entry,
       id: randomUUID(),
       timestamp: Date.now(),
       metadata: entry.metadata || "{}",
+      // Canonicalize scope whitespace at the write boundary so " agent " and
+      // "agent" cannot become distinct, partially invisible scopes.
+      scope: (entry.scope as string).trim(),
+      importance: clampImportance(Number(entry.importance)),
     }) as MemoryEntry);
 
     // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
@@ -1092,9 +1553,10 @@ export class MemoryStore {
         const chunk = allEntries.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
         const chunkIdx = Math.floor(i / MemoryStore.MAX_BATCH_SIZE);
         try {
-          await this.runWithFileLock(async () => {
-            await this.table!.add(chunk);
+          await this.runWithWriteLock(async () => {
+            await this.table!.add(chunk.map((entry) => this.toRow(entry)));
           });
+          this.noteDataModification();
         } catch (err) {
           lastError = err as Error;
           // 標記此 chunk 區間內的所有 caller 為失敗
@@ -1227,6 +1689,8 @@ export class MemoryStore {
    * @public
    */
   async destroy(): Promise<void> {
+    await drainManualRecallMetadata(this);
+
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -1247,6 +1711,7 @@ export class MemoryStore {
     // 1. destroy() 自己有錯 + lastBackgroundError 也有值 → composite error（兩個都保留）
     // 2. 只有 destroy() 自己有錯 → 只 throw destroy 的錯誤
     // 3. 只有 lastBackgroundError 有值 → throw timer 歷史錯誤
+    let destroyError: Error | null = null;
     if (result.hasError && result.lastError) {
       if (this.lastBackgroundError?.hasError) {
         // 情境 1：兩個錯誤都保留，包成 composite error
@@ -1258,18 +1723,24 @@ export class MemoryStore {
           `destroy flush failed (${result.lastError.message}); background flush also failed: ${timerError.message}`,
           { cause: result.lastError }
         );
-        throw compositeError;
+        destroyError = compositeError;
+      } else {
+        // 情境 2：只有 destroy 自己有錯
+        destroyError = result.lastError;
       }
-      // 情境 2：只有 destroy 自己有錯
-      throw result.lastError;
     }
 
     // 【F1 fix】檢查 lastBackgroundError（timers 錯誤的最後堡壘）
     // 情境 3：只有 lastBackgroundError 有值
-    if (this.lastBackgroundError?.hasError) {
+    if (!destroyError && this.lastBackgroundError?.hasError) {
       const err = this.lastBackgroundError.lastError ?? new Error("background flush failed");
       this.lastBackgroundError = null;
-      throw err;
+      destroyError = err;
+    }
+
+    await this.closeLockResources();
+    if (destroyError) {
+      throw destroyError;
     }
   }
 
@@ -1277,8 +1748,17 @@ export class MemoryStore {
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
+   *
+   * Default behavior treats the entry as a generic v2+ import and applies
+   * idempotent `clampImportance` (preserves 0, 1, and decimal v2+ values).
+   * For known-legacy data sources (e.g. `migrate.ts` / explicit backfill),
+   * pass `{ legacy: true }` to apply the v1.x 1-5 integer → 0~1 mapping
+   * exactly once at this explicit legacy-provenance boundary.
    */
-  async importEntry(entry: MemoryEntry): Promise<MemoryEntry> {
+  async importEntry(
+    entry: MemoryEntry,
+    options: ImportEntryOptions = {},
+  ): Promise<MemoryEntry> {
     await this.ensureInitialized();
 
     if (!entry.id || typeof entry.id !== "string") {
@@ -1292,16 +1772,29 @@ export class MemoryStore {
       );
     }
 
+    // Same fail-closed contract as store(): a missing or whitespace-only
+    // scope must never be silently converted into globally visible data.
+    // Legacy callers assign an explicit scope (migrate falls back to its
+    // default scope); genuinely scope-less legacy rows are repair-scopes'
+    // job, not an import-time coercion.
+    if (!hasValidEntryScope(entry.scope)) {
+      throw new Error(
+        "importEntry requires a non-empty scope: scope-less rows are invisible to scoped readers (assign an explicit scope, or leave legacy rows to repair-scopes)",
+      );
+    }
+
     const full: MemoryEntry = {
       ...entry,
-      scope: entry.scope || "global",
-      importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,
+      scope: entry.scope.trim(),
+      importance: options.legacy
+        ? normalizeLegacyImportance(entry.importance)
+        : clampImportance(entry.importance),
       timestamp: normalizeMemoryTimestamp(entry.timestamp),
       metadata: entry.metadata || "{}",
     };
 
-    return this.runWithFileLock(async () => {
-      await this.table!.add([full]);
+    return this.runWithWriteLock(async () => {
+      await this.table!.add([this.toRow(full)]);
       return full;
     });
   }
@@ -1323,6 +1816,50 @@ export class MemoryStore {
     return await this.table!.countRows();
   }
 
+  /**
+   * Finds rows whose id starts with `prefix`, restricted to accessible
+   * scopes. Backs the documented "full UUID or 8+ char prefix" contract on
+   * memory_forget/memory_update: injected context shows agents truncated ids,
+   * so a unique-prefix lookup is the only way those handles can ever resolve.
+   * The prefix must be hex/dash shaped (validated here, defense in depth on
+   * top of the tool-layer classification) and at least 8 chars, so a short
+   * or malformed ref can never scan-match. Capped at `limit` matches: the
+   * caller only distinguishes zero / one / many.
+   */
+  async findByIdPrefix(
+    prefix: string,
+    scopeFilter?: string[],
+    limit = 5,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+    const normalized = prefix.trim().toLowerCase();
+    if (!/^[0-9a-f][0-9a-f-]{7,35}$/.test(normalized)) return [];
+
+    const safePrefix = escapeSqlLiteral(normalized);
+    const rows = await this.table!
+      .query()
+      .where(`id LIKE '${safePrefix}%'`)
+      .limit(Math.max(1, limit))
+      .toArray();
+
+    return rows
+      .filter((row) => {
+        return isRowScopeAccessible(row.scope as string | null | undefined, scopeFilter);
+      })
+      .map((row) => ({
+        id: row.id as string,
+        text: row.text as string,
+        vector: Array.from(row.vector as Iterable<number>),
+        category: row.category as MemoryEntry["category"],
+        scope: (row.scope as string | null | undefined) ?? "global",
+        importance: clampImportance(Number(row.importance)),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+        metadata: (row.metadata as string) || "{}",
+      }));
+  }
+
   async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 
@@ -1338,8 +1875,8 @@ export class MemoryStore {
     if (rows.length === 0) return null;
 
     const row = rows[0];
-    const rowScope = (row.scope as string | undefined) ?? "global";
-    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+    const realScope = row.scope as string | null | undefined;
+    if (!isRowScopeAccessible(realScope, scopeFilter)) {
       return null;
     }
 
@@ -1348,8 +1885,8 @@ export class MemoryStore {
       text: row.text as string,
       vector: Array.from(row.vector as Iterable<number>),
       category: row.category as MemoryEntry["category"],
-      scope: rowScope,
-      importance: Number(row.importance),
+      scope: realScope ?? "global",
+      importance: clampImportance(Number(row.importance)),
       timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
     };
@@ -1385,12 +1922,12 @@ export class MemoryStore {
 
     if (rows.length === 0) return false;
 
-    const rowScope = (rows[0].scope as string | undefined) ?? "global";
-    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+    const realScope = rows[0].scope as string | null | undefined;
+    if (!isRowScopeAccessible(realScope, scopeFilter)) {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       await this.table!.delete(`id = '${safeId}'`);
       return true;
     });
@@ -1433,7 +1970,7 @@ export class MemoryStore {
         const scopeConditions = scopeFilter
           .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
           .join(" OR ");
-        query = query.where(`(${scopeConditions}) OR scope IS NULL`);
+        query = query.where(`(${scopeConditions})`);
       }
 
       const results = await query.toArray();
@@ -1451,11 +1988,7 @@ export class MemoryStore {
       const rowScope = (row.scope as string | undefined) ?? "global";
 
       // Double-check scope filter in application layer
-      if (
-        scopeFilter &&
-        scopeFilter.length > 0 &&
-        !scopeFilter.includes(rowScope)
-      ) {
+      if (!isRowScopeAccessible(row.scope as string | null | undefined, scopeFilter)) {
         continue;
       }
 
@@ -1465,7 +1998,7 @@ export class MemoryStore {
         vector: rowVector,
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1529,14 +2062,14 @@ export class MemoryStore {
     try {
       let mapped: MemorySearchResult[] = [];
       while (true) {
-        let searchQuery = this.table!.search(query, "fts").limit(fetchLimit);
+        let searchQuery = this.table!.search(query, "fts", this.ftsColumn).limit(fetchLimit);
 
         if (scopeFilter && scopeFilter.length > 0) {
           const scopeConditions = scopeFilter
             .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
             .join(" OR ");
           searchQuery = searchQuery.where(
-            `(${scopeConditions}) OR scope IS NULL`,
+            `(${scopeConditions})`,
           );
         }
 
@@ -1546,11 +2079,7 @@ export class MemoryStore {
         const rowScope = (row.scope as string | undefined) ?? "global";
 
         // Double-check scope filter in application layer
-        if (
-          scopeFilter &&
-          scopeFilter.length > 0 &&
-          !scopeFilter.includes(rowScope)
-        ) {
+        if (!isRowScopeAccessible(row.scope as string | null | undefined, scopeFilter)) {
           continue;
         }
 
@@ -1563,10 +2092,10 @@ export class MemoryStore {
         const entry: MemoryEntry = {
             id: row.id as string,
             text: row.text as string,
-            vector: row.vector as number[],
+            vector: toNumberVector(row.vector),
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
-            importance: Number(row.importance),
+            importance: clampImportance(Number(row.importance)),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: (row.metadata as string) || "{}",
         };
@@ -1631,7 +2160,9 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      searchQuery = searchQuery.where(`(${scopeConditions})`);
     }
 
     const rows = await searchQuery.toArray();
@@ -1639,17 +2170,17 @@ export class MemoryStore {
 
     for (const row of rows) {
       const rowScope = (row.scope as string | undefined) ?? "global";
-      if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+      if (!isRowScopeAccessible(row.scope as string | null | undefined, scopeFilter)) {
         continue;
       }
 
       const entry: MemoryEntry = {
         id: row.id as string,
         text: row.text as string,
-        vector: row.vector as number[],
+        vector: toNumberVector(row.vector),
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
-        importance: Number(row.importance),
+        importance: clampImportance(Number(row.importance)),
         timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
         metadata: (row.metadata as string) || "{}",
       };
@@ -1732,18 +2263,14 @@ export class MemoryStore {
     }
 
     const resolvedId = candidates[0].id as string;
-    const rowScope = (candidates[0].scope as string | undefined) ?? "global";
+    const realScope = candidates[0].scope as string | null | undefined;
 
     // Check scope permissions
-    if (
-      scopeFilter &&
-      scopeFilter.length > 0 &&
-      !scopeFilter.includes(rowScope)
-    ) {
+    if (!isRowScopeAccessible(realScope, scopeFilter)) {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       await this.table!.delete(`id = '${resolvedId}'`);
       return true;
     });
@@ -1754,6 +2281,7 @@ export class MemoryStore {
     category?: string,
     limit = 20,
     offset = 0,
+    options?: { excludeInactive?: boolean },
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
@@ -1766,11 +2294,16 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      conditions.push(`(${scopeConditions})`);
     }
 
     if (category) {
-      conditions.push(`category = '${escapeSqlLiteral(category)}'`);
+      const categoryConditions = resolveCategoryFilterCandidates(category)
+        .map((candidate) => `category = '${escapeSqlLiteral(candidate)}'`)
+        .join(" OR ");
+      conditions.push(`(${categoryConditions})`);
     }
 
     const applyConditions = (query: any) =>
@@ -1790,7 +2323,7 @@ export class MemoryStore {
       ],
     );
 
-    return results
+    const entries = results
       .map(
         (row): MemoryEntry => ({
           id: row.id as string,
@@ -1798,13 +2331,93 @@ export class MemoryStore {
           vector: [], // Don't include vectors in list results for performance
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
+          importance: clampImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
         }),
-      )
+      );
+
+    // excludeInactive preserves the pre-#946 API default (false): live-only
+    // reads are an explicit per-caller opt-in (retriever, dedup prefilter,
+    // consolidate), so existing whole-store callers keep their population.
+    // invisible to list() unless a caller opts out explicitly (item 6, PR #946).
+    const excludeInactive = options?.excludeInactive ?? false;
+    const activeEntries = excludeInactive
+      ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+      : entries;
+
+    return (category
+      ? activeEntries.filter((entry) =>
+          matchesMemoryCategoryFilter(entry.category, category, entry.metadata),
+        )
+      : activeEntries)
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
       .slice(offset, offset + limit);
+  }
+
+  /**
+   * Bounded candidate scan for fact-key collision discovery. Unlike list(),
+   * which materializes and sorts the entire matching scope on every call,
+   * this pushes a hard row limit into the database query and never sorts.
+   * Deliberately NO content-based narrowing: an effective fact key can come
+   * from an explicit metadata field in any valid JSON layout (spaced colons,
+   * unicode escapes), from a stamped memory category in the same layouts, or
+   * be derived from the legacy storage category column plus row text when
+   * metadata is empty — so any serialization-layout pattern (LIKE on raw
+   * JSON) can exclude a valid candidate and silently break the collision
+   * set's completeness. Completeness therefore comes from the scope itself:
+   * every in-scope row is a candidate, the caller's bound keeps the scan
+   * finite, and an over-bound scope is an explicit rejection rather than a
+   * narrowed guess. Exact normalized-key comparison and active-row filtering
+   * stay with the caller.
+   * Returns at most bound + 1 rows so the caller can detect an over-bound
+   * candidate set without this method ever fetching an unbounded one.
+   */
+  async listFactKeyCandidates(
+    scopeFilter: string[],
+    bound: number,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+
+    const conditions: string[] = [];
+    if (scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      conditions.push(`(${scopeConditions})`);
+    }
+
+    const applyConditions = (query: any) =>
+      conditions.length > 0
+        ? query.where(conditions.join(" AND ")).limit(bound + 1)
+        : query.limit(bound + 1);
+
+    const results = await this.queryRowsWithProjectionFallback(
+      applyConditions,
+      [
+        "id",
+        "text",
+        "category",
+        "scope",
+        "importance",
+        "timestamp",
+        "metadata",
+      ],
+    );
+
+    return results.map(
+      (row): MemoryEntry => ({
+        id: row.id as string,
+        text: row.text as string,
+        vector: [],
+        category: row.category as MemoryEntry["category"],
+        scope: (row.scope as string | undefined) ?? "global",
+        importance: clampImportance(Number(row.importance)),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+        metadata: (row.metadata as string) || "{}",
+      }),
+    );
   }
 
   private async queryRowsWithProjectionFallback(
@@ -1825,8 +2438,24 @@ export class MemoryStore {
     return await applyFilters(this.table!.query()).toArray();
   }
 
+  /**
+   * Liveness for stats() without a full metadata parse where the answer is
+   * already determined: a blob carrying neither activity key parses to
+   * valid_from = the row timestamp and no invalidated_at, so it is live iff
+   * that timestamp is not in the future. Any blob that mentions either key
+   * (a substring hit inside a text value merely takes the slow path) is
+   * parsed and judged exactly as before.
+   */
+  private isLiveRow(rawMetadata: string, timestamp: number, at: number): boolean {
+    if (!rawMetadata.includes('"invalidated_at"') && !rawMetadata.includes('"valid_from"')) {
+      return timestamp <= at;
+    }
+    return isMemoryActiveAt(parseSmartMetadata(rawMetadata, { timestamp }), at);
+  }
+
   async stats(scopeFilter?: string[]): Promise<{
     totalCount: number;
+    liveCount: number;
     scopeCounts: Record<string, number>;
     categoryCounts: Record<string, number>;
   }> {
@@ -1836,6 +2465,7 @@ export class MemoryStore {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) {
       return {
         totalCount: 0,
+        liveCount: 0,
         scopeCounts: {},
         categoryCounts: {},
       };
@@ -1846,19 +2476,27 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      conditions.push(`(${scopeConditions})`);
     }
 
     const applyConditions = (query: any) =>
       conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
 
+    // scopeCounts/categoryCounts stay blended (total, historical record
+    // included) -- only the top-level total/live split is added here, per
+    // item 6 (PR #946): "report a live vs total split rather than one
+    // blended count."
     const results = await this.queryRowsWithProjectionFallback(
       applyConditions,
-      ["scope", "category"],
+      ["scope", "category", "metadata", "timestamp"],
     );
 
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
+    let liveCount = 0;
+    const now = Date.now();
 
     for (const row of results) {
       const scope = (row.scope as string | undefined) ?? "global";
@@ -1866,24 +2504,507 @@ export class MemoryStore {
 
       scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
       categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+
+      if (this.isLiveRow((row.metadata as string) || "{}", normalizeMemoryTimestamp(row.timestamp, 0), now)) {
+        liveCount += 1;
+      }
     }
 
     return {
       totalCount: results.length,
+      liveCount,
       scopeCounts,
       categoryCounts,
     };
   }
 
+  /**
+   * Merge coalesced manual-recall reinforcement into exact IDs under one lock.
+   *
+   * The row read and metadata merge both happen after the write lock is held,
+   * so concurrent recall events cannot overwrite a newer counter/timestamp
+   * snapshot. `expectedScope` preserves the authorization decision made by the
+   * retrieval path without widening the caller's readable scopes.
+   */
+  async applyManualRecallMetadataBatch(
+    updates: ManualRecallMetadataUpdate[],
+  ): Promise<MemoryBulkUpdateResult[]> {
+    await this.ensureInitialized();
+    if (updates.length === 0) return [];
+
+    let settledResults: MemoryBulkUpdateResult[] | null = null;
+    const applyBatch = () => this.runSerializedUpdate(async () => {
+      await this.checkoutLatestTableForWrite();
+      const results = new Map<number, MemoryBulkUpdateResult>();
+      const pending: Array<ManualRecallMetadataUpdate & { inputIndex: number }> = [];
+      const seenUpdates = new Set<string>();
+
+      updates.forEach((candidate, inputIndex) => {
+        const updateKey = `${candidate.id}\u0000${candidate.expectedScope}`;
+        const isValidId =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate.id) ||
+          isLegacyStableMemoryId(candidate.id);
+        if (!isValidId) {
+          results.set(inputIndex, {
+            id: String(candidate.id),
+            entry: null,
+            error: `Invalid exact memory ID: ${String(candidate.id)}`,
+            retryable: false,
+          });
+          return;
+        }
+        if (seenUpdates.has(updateKey)) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Duplicate exact memory ID and scope: ${candidate.id} (${candidate.expectedScope})`,
+            retryable: false,
+          });
+          return;
+        }
+        if (!Number.isInteger(candidate.accessCountDelta) || candidate.accessCountDelta <= 0) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Invalid accessCountDelta for ${candidate.id}`,
+            retryable: false,
+          });
+          return;
+        }
+        if (!Number.isFinite(candidate.accessedAt) || candidate.accessedAt <= 0) {
+          results.set(inputIndex, {
+            id: candidate.id,
+            entry: null,
+            error: `Invalid accessedAt for ${candidate.id}`,
+            retryable: false,
+          });
+          return;
+        }
+        seenUpdates.add(updateKey);
+        pending.push({ ...candidate, inputIndex });
+      });
+
+      for (let i = 0; i < pending.length; i += MemoryStore.MAX_BATCH_SIZE) {
+        const chunk = pending.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+        const whereClause = chunk
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        let rows: any[];
+        try {
+          rows = whereClause.length > 0
+            ? await this.table!.query().where(`(${whereClause})`).toArray()
+            : [];
+        } catch (queryError) {
+          const queryMessage = queryError instanceof Error ? queryError.message : String(queryError);
+          for (const candidate of chunk) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error: `Failed to read recall metadata for ${candidate.id}: ${queryMessage}`,
+              retryable: true,
+            });
+          }
+          continue;
+        }
+        const rowsById = new Map<string, any>();
+        for (const row of rows) rowsById.set(row.id as string, row);
+
+        const originals: MemoryEntry[] = [];
+        const updatedEntries: MemoryEntry[] = [];
+        const updatedInputIndices: number[] = [];
+
+        for (const candidate of chunk) {
+          const row = rowsById.get(candidate.id);
+          if (!row) {
+            results.set(candidate.inputIndex, { id: candidate.id, entry: null });
+            continue;
+          }
+
+          const rowScope = (row.scope as string | undefined) ?? "global";
+          if (rowScope !== candidate.expectedScope) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error:
+                `Memory ${candidate.id} scope changed from ` +
+                `${candidate.expectedScope} to ${rowScope}`,
+              retryable: false,
+            });
+            continue;
+          }
+
+          const original: MemoryEntry = {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: (row.metadata as string) || "{}",
+          };
+          const current = parseSmartMetadata(original.metadata, original);
+          const accessedAt = Math.max(current.last_accessed_at, candidate.accessedAt);
+          const confirmedAt = Math.max(
+            current.last_confirmed_use_at ?? 0,
+            candidate.accessedAt,
+          );
+          const snapshot = candidate.governanceSnapshot;
+          const governanceUnchanged = snapshot !== undefined &&
+            current.bad_recall_count === snapshot.badRecallCount &&
+            current.suppressed_until_turn === snapshot.suppressedUntilTurn &&
+            current.suppressed_until_ms === snapshot.suppressedUntilMs;
+          const governanceReset = governanceUnchanged
+            ? {
+                bad_recall_count: 0,
+                suppressed_until_turn: 0,
+                suppressed_until_ms: 0,
+              }
+            : {};
+          const metadata = stringifySmartMetadata(buildSmartMetadata(original, {
+            access_count: current.access_count + candidate.accessCountDelta,
+            last_accessed_at: accessedAt,
+            last_confirmed_use_at: confirmedAt,
+            ...governanceReset,
+          }));
+
+          originals.push(original);
+          updatedEntries.push({ ...original, metadata });
+          updatedInputIndices.push(candidate.inputIndex);
+        }
+
+        if (updatedEntries.length === 0) continue;
+
+        const mergeWhereClause = updatedEntries
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        const classifyUncertainMerge = async (reason: string): Promise<void> => {
+          let dataMayHaveChanged = false;
+          let rowsAfterFailure: any[];
+          try {
+            await this.checkoutLatestTableForWrite();
+            rowsAfterFailure = await this.table!.query()
+              .where(`(${mergeWhereClause})`)
+              .toArray();
+          } catch (recoveryError) {
+            this.noteDataModification();
+            const recoveryMessage = recoveryError instanceof Error
+              ? recoveryError.message
+              : String(recoveryError);
+            for (let index = 0; index < updatedEntries.length; index++) {
+              results.set(updatedInputIndices[index], {
+                id: updatedEntries[index].id,
+                entry: null,
+                error:
+                  `Atomic recall metadata merge failed for ${updatedEntries[index].id}: ` +
+                  `${reason}. Commit state could not be verified: ${recoveryMessage}`,
+                retryable: false,
+              });
+            }
+            return;
+          }
+
+          const rowsAfterFailureById = new Map<string, any>();
+          for (const row of rowsAfterFailure) rowsAfterFailureById.set(row.id as string, row);
+          for (let index = 0; index < updatedEntries.length; index++) {
+            const original = originals[index];
+            const updatedEntry = updatedEntries[index];
+            const row = rowsAfterFailureById.get(updatedEntry.id);
+            const rowScope = (row?.scope as string | undefined) ?? "global";
+            const persistedMetadata = typeof row?.metadata === "string" ? row.metadata : "{}";
+            if (row && rowScope === updatedEntry.scope && persistedMetadata === updatedEntry.metadata) {
+              dataMayHaveChanged = true;
+              results.set(updatedInputIndices[index], {
+                id: updatedEntry.id,
+                entry: updatedEntry,
+              });
+              continue;
+            }
+            if (row && rowScope === original.scope && persistedMetadata === original.metadata) {
+              results.set(updatedInputIndices[index], {
+                id: original.id,
+                entry: null,
+                error: `Atomic recall metadata merge failed for ${original.id}: ${reason}`,
+                retryable: true,
+              });
+              continue;
+            }
+            results.set(updatedInputIndices[index], {
+              id: updatedEntry.id,
+              entry: null,
+              error:
+                `Atomic recall metadata merge failed for ${updatedEntry.id}: ${reason}. ` +
+                `Persisted state no longer matches either the original or updated row`,
+              retryable: false,
+            });
+            dataMayHaveChanged = true;
+          }
+          if (dataMayHaveChanged) this.noteDataModification();
+        };
+
+        try {
+          const mergeResult = await this.table!
+            .mergeInsert("id")
+            .whenMatchedUpdateAll({
+              where:
+                "target.scope = source.scope OR " +
+                "(target.scope IS NULL AND source.scope = 'global')",
+            })
+            .execute(updatedEntries.map((entry) => this.toRow(entry)));
+          if (mergeResult.numUpdatedRows !== updatedEntries.length) {
+            await classifyUncertainMerge(
+              `updated ${mergeResult.numUpdatedRows} of ${updatedEntries.length} expected rows`,
+            );
+            continue;
+          }
+          this.noteDataModification();
+          for (let index = 0; index < updatedEntries.length; index++) {
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: updatedEntries[index],
+            });
+          }
+        } catch (writeError) {
+          const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
+          await classifyUncertainMerge(writeMessage);
+        }
+      }
+
+      settledResults = updates.map((candidate, inputIndex) =>
+        results.get(inputIndex) ?? {
+          id: candidate.id,
+          entry: null,
+          error: `Memory ${candidate.id} was not processed`,
+          retryable: false,
+        },
+      );
+      return settledResults;
+    });
+
+    try {
+      return await this.runWithWriteLock(applyBatch);
+    } catch (error) {
+      if (settledResults !== null) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new ManualRecallMetadataBatchSettledError(
+          `Manual recall metadata batch settled before the write lock failed: ${message}`,
+          settledResults,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Update multiple already-resolved memory IDs under one write lock.
+   *
+   * This intentionally accepts exact IDs only. Interactive callers that rely on
+   * short-prefix resolution should keep using update(), while bulk maintenance
+   * jobs can avoid repeated file-lock churn once they already have full row IDs.
+   */
+  async bulkUpdateExact(
+    updates: Array<{ id: string; updates: MemoryUpdatePatch }>,
+    scopeFilter?: string[],
+  ): Promise<MemoryBulkUpdateResult[]> {
+    await this.ensureInitialized();
+
+    if (updates.length === 0) return [];
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      return updates.map(({ id }) => ({
+        id,
+        entry: null,
+        error: `Memory ${id} is outside accessible scopes`,
+      }));
+    }
+
+    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      const results = new Map<number, MemoryBulkUpdateResult>();
+      const pending: Array<{ inputIndex: number; id: string; updates: MemoryUpdatePatch }> = [];
+      const seenIds = new Set<string>();
+
+      updates.forEach((candidate, inputIndex) => {
+        const id = candidate.id;
+        if (typeof id !== "string" || id.length === 0) {
+          results.set(inputIndex, {
+            id: String(id),
+            entry: null,
+            error: `Invalid memory ID format: ${String(id)}`,
+          });
+          return;
+        }
+        if (seenIds.has(id)) {
+          results.set(inputIndex, {
+            id,
+            entry: null,
+            error: `Duplicate memory ID in bulk update: ${id}`,
+          });
+          return;
+        }
+        seenIds.add(id);
+        pending.push({ inputIndex, id, updates: candidate.updates });
+      });
+
+      for (let i = 0; i < pending.length; i += MemoryStore.MAX_BATCH_SIZE) {
+        const chunk = pending.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+        const whereClause = chunk
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        const rows = whereClause.length > 0
+          ? await this.table!.query().where(`(${whereClause})`).toArray()
+          : [];
+        const rowsById = new Map<string, any>();
+        for (const row of rows) {
+          rowsById.set(row.id as string, row);
+        }
+
+        const originals: MemoryEntry[] = [];
+        const updatedEntries: MemoryEntry[] = [];
+        const persistedUpdates: MemoryEntry[] = [];
+        const updatedInputIndices: number[] = [];
+
+        for (const candidate of chunk) {
+          const row = rowsById.get(candidate.id);
+          if (!row) {
+            results.set(candidate.inputIndex, { id: candidate.id, entry: null });
+            continue;
+          }
+
+          const realScope = row.scope as string | null | undefined;
+          if (!isRowScopeAccessible(realScope, scopeFilter)) {
+            results.set(candidate.inputIndex, {
+              id: candidate.id,
+              entry: null,
+              error: `Memory ${candidate.id} is outside accessible scopes`,
+            });
+            continue;
+          }
+          const rowScope = realScope ?? "global";
+          // Display mask only — see update(): mutations persist the RAW scope.
+          const persistedScope = (hasValidEntryScope(realScope) ? realScope.trim() : null) as unknown as string;
+
+          const original: MemoryEntry = {
+            id: row.id as string,
+            text: row.text as string,
+            vector: Array.from(row.vector as Iterable<number>),
+            category: row.category as MemoryEntry["category"],
+            scope: rowScope,
+            importance: Number(row.importance),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: (row.metadata as string) || "{}",
+          };
+          const updated: MemoryEntry = {
+            ...original,
+            text: candidate.updates.text ?? original.text,
+            vector: candidate.updates.vector ?? original.vector,
+            category: candidate.updates.category ?? original.category,
+            scope: rowScope,
+            // F3 fix (PR #828 follow-up): clamp importance on update path so
+            // bulkUpdateExact callers cannot persist out-of-range values.
+            importance: clampImportance(
+              candidate.updates.importance ?? original.importance,
+            ),
+            timestamp: original.timestamp,
+            metadata: candidate.updates.metadata ?? original.metadata,
+          };
+
+          originals.push({ ...original, scope: persistedScope });
+          persistedUpdates.push({ ...updated, scope: persistedScope });
+          updatedEntries.push(updated);
+          updatedInputIndices.push(candidate.inputIndex);
+        }
+
+        if (updatedEntries.length === 0) {
+          continue;
+        }
+
+        const deleteWhereClause = updatedEntries
+          .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+          .join(" OR ");
+        let deleted = false;
+        try {
+          await this.table!.delete(`(${deleteWhereClause})`);
+          deleted = true;
+          await this.table!.add(persistedUpdates.map((entry) => this.toRow(entry)));
+          this.noteDataModification();
+          for (let index = 0; index < updatedEntries.length; index++) {
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: updatedEntries[index],
+            });
+          }
+        } catch (writeError) {
+          const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
+          if (!deleted) {
+            for (let index = 0; index < updatedEntries.length; index++) {
+              results.set(updatedInputIndices[index], {
+                id: updatedEntries[index].id,
+                entry: null,
+                error:
+                  `Failed to bulk update memory ${updatedEntries[index].id}: delete failed before replacement write. ` +
+                  `Write error: ${writeMessage}`,
+              });
+            }
+            continue;
+          }
+
+          const existingAfterFailure = await this.table!.query()
+            .where(`(${deleteWhereClause})`)
+            .toArray()
+            .catch(() => []);
+          const preservedIds = new Set(
+            existingAfterFailure.map((row: any) => row.id as string),
+          );
+          const originalsToRestore = originals.filter((entry) => !preservedIds.has(entry.id));
+
+          try {
+            if (originalsToRestore.length > 0) {
+              await this.table!.add(originalsToRestore.map((entry) => this.toRow(entry)));
+            }
+          } catch (rollbackError) {
+            const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+            for (let index = 0; index < updatedEntries.length; index++) {
+              results.set(updatedInputIndices[index], {
+                id: updatedEntries[index].id,
+                entry: null,
+                error:
+                  `Failed to bulk update memory ${updatedEntries[index].id}: write failed and rollback also failed. ` +
+                  `Write error: ${writeMessage}. Rollback error: ${rollbackMessage}`,
+              });
+            }
+            continue;
+          }
+
+          for (let index = 0; index < updatedEntries.length; index++) {
+            const preserved = preservedIds.has(updatedEntries[index].id);
+            results.set(updatedInputIndices[index], {
+              id: updatedEntries[index].id,
+              entry: null,
+              error:
+                `Failed to bulk update memory ${updatedEntries[index].id}: ` +
+                (preserved
+                  ? "write failed after delete, but an existing row was preserved. "
+                  : "write failed, original row restored. ") +
+                `Write error: ${writeMessage}`,
+            });
+          }
+        }
+      }
+
+      return updates.map((candidate, inputIndex) =>
+        results.get(inputIndex) ?? {
+          id: candidate.id,
+          entry: null,
+          error: `Memory ${candidate.id} was not processed`,
+        },
+      );
+    }));
+  }
+
   async update(
     id: string,
-    updates: {
-      text?: string;
-      vector?: number[];
-      importance?: number;
-      category?: MemoryEntry["category"];
-      metadata?: string;
-    },
+    updates: MemoryUpdatePatch,
     scopeFilter?: string[],
   ): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
@@ -1892,129 +3013,144 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
-      // Support both full UUID and short prefix (8+ hex chars), same as delete()
-      // Also support legacy mem-md-N format from older memory-lancedb-pro versions
-      const uuidRegex =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      const prefixRegex = /^[0-9a-f]{8,}$/i;
-      const legacyRegex = /^mem-md-\d+$/i;
-      const isFullId = uuidRegex.test(id);
-      const isPrefix = !isFullId && prefixRegex.test(id);
-      const isLegacy = !isFullId && !isPrefix && legacyRegex.test(id);
+    return this.runWithWriteLock(() =>
+      this.runSerializedUpdate(() => this.performUpdateLocked(id, updates, scopeFilter)),
+    );
+  }
 
-      if (!isFullId && !isPrefix && !isLegacy) {
-        throw new Error(`Invalid memory ID format: ${id}`);
-      }
+  /**
+   * The locked body of update(). Callers must already hold the write lock
+   * and the serialized-update slot: update() wraps it, transformMetadata
+   * composes it with a fresh read-decide step under the same lock, and the
+   * supersede commit path calls it from inside its own atomic section.
+   */
+  private async performUpdateLocked(
+    id: string,
+    updates: MemoryUpdatePatch,
+    scopeFilter?: string[],
+  ): Promise<MemoryEntry | null> {
+    // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+    // from older stores (for example "mem-md-..." or "data-pointer-...").
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const prefixRegex = /^[0-9a-f]{8,}$/i;
+    const isFullId = uuidRegex.test(id);
+    const isPrefix = !isFullId && prefixRegex.test(id);
+    const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
 
-      let rows: any[];
-      if (isFullId || isLegacy) {
-        // Legacy IDs use exact string match like full UUIDs
-        const safeId = escapeSqlLiteral(id);
-        rows = await this.table!.query()
-          .where(`id = '${safeId}'`)
-          .limit(1)
-          .toArray();
-      } else {
-        // Exact match first: full non-UUID hex ids (e.g. 64-char legacy) also match prefixRegex
-        rows = await this.table!.query()
-          .where(`id = '${escapeSqlLiteral(id)}'`)
-          .limit(1)
-          .toArray();
-        if (rows.length === 0) {
-          // Prefix match: scan ids only (no row cap), then load the single match
-          const all = await this.table!.query()
-            .select(["id"])
-            .toArray();
-          const matches = all.filter((r: any) => (r.id as string).startsWith(id));
-          if (matches.length > 1) {
-            throw new Error(
-              `Ambiguous prefix "${id}" matches ${matches.length} memories. Use a longer prefix or full ID.`,
-            );
-          }
-          if (matches.length === 1) {
-            rows = await this.table!.query()
-              .where(`id = '${escapeSqlLiteral(matches[0].id as string)}'`)
-              .limit(1)
-              .toArray();
-          }
+    if (!isFullId && !isPrefix && !isLegacyStableId) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
+
+    let rows: any[];
+    if (isFullId || isLegacyStableId) {
+      // Legacy IDs use exact string match like full UUIDs.
+      const safeId = escapeSqlLiteral(id);
+      rows = await this.table!.query()
+        .where(`id = '${safeId}'`)
+        .limit(1)
+        .toArray();
+    } else {
+      // Prefer an exact hex ID before looking for a prefix, including legacy
+      // 64-character IDs. Query all candidate IDs to detect ambiguity.
+      rows = await this.table!.query()
+        .where(`id = '${escapeSqlLiteral(id)}'`).limit(1).toArray();
+      if (rows.length === 0) {
+        const all = await this.table!.query().select(["id"]).toArray();
+        const matches = all.filter((r: any) => (r.id as string).startsWith(id));
+        if (matches.length > 1) {
+          throw new Error(`Ambiguous prefix "${id}" matches ${matches.length} memories. Use a longer prefix or full ID.`);
+        }
+        if (matches.length === 1) {
+          rows = await this.table!.query()
+            .where(`id = '${escapeSqlLiteral(matches[0].id as string)}'`).limit(1).toArray();
         }
       }
+    }
 
-      if (rows.length === 0) return null;
+    if (rows.length === 0) return null;
 
-      const row = rows[0];
-      const rowScope = (row.scope as string | undefined) ?? "global";
+    const row = rows[0];
+    const realScope = row.scope as string | null | undefined;
 
-      // Check scope permissions
-      if (
-        scopeFilter &&
-        scopeFilter.length > 0 &&
-        !scopeFilter.includes(rowScope)
-      ) {
-        throw new Error(`Memory ${id} is outside accessible scopes`);
-      }
+    // Check scope permissions
+    if (!isRowScopeAccessible(realScope, scopeFilter)) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
+    const rowScope = realScope ?? "global";
+    // Display mask only. Mutations must persist the RAW stored scope: writing
+    // the "global" mask back would turn an invisible legacy NULL-scope row
+    // into a globally visible one (cross-agent disclosure). Valid scopes are
+    // canonicalized by trim; legacy NULL/blank stays NULL.
+    const persistedScope = (hasValidEntryScope(realScope) ? realScope.trim() : null) as unknown as string;
 
-      const original: MemoryEntry = {
-        id: row.id as string,
-        text: row.text as string,
-        vector: Array.from(row.vector as Iterable<number>),
-        category: row.category as MemoryEntry["category"],
-        scope: rowScope,
-        importance: Number(row.importance),
-        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-        metadata: (row.metadata as string) || "{}",
-      };
+    const original: MemoryEntry = {
+      id: row.id as string,
+      text: row.text as string,
+      vector: Array.from(row.vector as Iterable<number>),
+      category: row.category as MemoryEntry["category"],
+      scope: rowScope,
+      importance: clampImportance(Number(row.importance)),
+      timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+      metadata: (row.metadata as string) || "{}",
+    };
 
-      // Build updated entry, preserving original timestamp
-      const updated: MemoryEntry = {
-        ...original,
-        text: updates.text ?? original.text,
-        vector: updates.vector ?? original.vector,
-        category: updates.category ?? original.category,
-        scope: rowScope,
-        importance: updates.importance ?? original.importance,
-        timestamp: original.timestamp, // preserve original
-        metadata: updates.metadata ?? original.metadata,
-      };
+    // Build updated entry, preserving original timestamp
+    const updated: MemoryEntry = {
+      ...original,
+      text: updates.text ?? original.text,
+      vector: updates.vector ?? original.vector,
+      category: updates.category ?? original.category,
+      scope: rowScope,
+      // F3 fix (PR #828 follow-up): clamp importance on update path so
+      // update() callers cannot persist out-of-range values.
+      importance: clampImportance(
+        updates.importance ?? original.importance,
+      ),
+      timestamp: original.timestamp, // preserve original
+      metadata: updates.metadata ?? original.metadata,
+    };
 
-      // LanceDB doesn't support in-place update; delete + re-add.
-      // Serialize updates per store instance to avoid stale rollback races.
-      // If the add fails after delete, attempt best-effort recovery without
-      // overwriting a newer concurrent successful update.
-      const rollbackCandidate =
-        (await this.getById(original.id).catch(() => null)) ?? original;
-      const resolvedId = escapeSqlLiteral(row.id as string);
-      await this.table!.delete(`id = '${resolvedId}'`);
-      try {
-        await this.table!.add([updated]);
-      } catch (addError) {
-        const current = await this.getById(original.id).catch(() => null);
-        if (current) {
-          throw new Error(
-            `Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
-            `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
-          );
-        }
-
-        try {
-          await this.table!.add([rollbackCandidate]);
-        } catch (rollbackError) {
-          throw new Error(
-            `Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
-            `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
-            `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
-          );
-        }
-
+    // LanceDB doesn't support in-place update; delete + re-add.
+    // Serialize updates per store instance to avoid stale rollback races.
+    // If the add fails after delete, attempt best-effort recovery without
+    // overwriting a newer concurrent successful update.
+    const rollbackSource =
+      (await this.getById(original.id).catch(() => null)) ?? original;
+    // getById masks a NULL scope as "global" for display; restore the raw
+    // stored scope before any write (scope is immutable through update patches).
+    const rollbackCandidate: MemoryEntry = { ...rollbackSource, scope: persistedScope };
+    const resolvedId = escapeSqlLiteral(row.id as string);
+    await this.table!.delete(`id = '${resolvedId}'`);
+    try {
+      await this.table!.add([this.toRow({ ...updated, scope: persistedScope })]);
+    } catch (addError) {
+      const current = await this.getById(original.id).catch(() => null);
+      if (current) {
         throw new Error(
-          `Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
+          `Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
           `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
         );
       }
 
-      return updated;
-    }));
+      try {
+        await this.table!.add([this.toRow(rollbackCandidate)]);
+      } catch (rollbackError) {
+        throw new Error(
+          `Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
+          `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
+          `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+
+      throw new Error(
+        `Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
+        `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
+      );
+    }
+
+    this.noteDataModification();
+    return updated;
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
@@ -2040,7 +3176,7 @@ export class MemoryStore {
   ): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 
-    return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
       const existing = await this.getById(id, scopeFilter);
       if (!existing) return null;
 
@@ -2061,6 +3197,284 @@ export class MemoryStore {
     }));
   }
 
+  /**
+   * Legacy NULL/blank-scope rows predate scope hardening and are invisible to
+   * every scoped reader. These two methods are the migration path: find them,
+   * then reassign them to an explicit scope.
+   */
+  private materializeLegacyScopeRow(row: Record<string, unknown>): MemoryEntry {
+    const rawVector = row.vector as { toArray?: () => ArrayLike<number> } | ArrayLike<number> | null;
+    const vector = Array.isArray(rawVector)
+      ? rawVector
+      : rawVector && typeof (rawVector as { toArray?: unknown }).toArray === "function"
+        ? Array.from((rawVector as { toArray: () => ArrayLike<number> }).toArray())
+        : Array.from((rawVector as ArrayLike<number>) ?? []);
+    return {
+      id: String(row.id),
+      text: String(row.text ?? ""),
+      vector,
+      category: String(row.category ?? "fact"),
+      scope: (row.scope as string | null | undefined) ?? null,
+      importance: clampImportance(Number(row.importance)),
+      timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+      metadata: (row.metadata as string) || "{}",
+    } as MemoryEntry;
+  }
+
+  async findLegacyScopeRows(limit = 1000): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    const rows = await this.table!
+      .query()
+      .where("scope IS NULL OR scope = ''")
+      .limit(limit)
+      .toArray();
+    const legacy = rows.map((row: Record<string, unknown>) => this.materializeLegacyScopeRow(row));
+
+    // Whitespace-only scopes are invalid under the public write validator, so
+    // they are exactly as invisible to scoped readers as NULL and '' — repair
+    // must discover them too. Lance's SQL pushdown rejects trim(), so project
+    // only id+scope over the remaining rows and filter client-side, then
+    // materialize the (rare) hits individually with their full content.
+    if (legacy.length < limit) {
+      const scopedRows = await this.table!
+        .query()
+        .select(["id", "scope"])
+        .where("scope IS NOT NULL AND scope != ''")
+        .toArray();
+      const whitespaceIds = scopedRows
+        .filter((row: Record<string, unknown>) =>
+          typeof row.scope === "string" && (row.scope as string).trim() === "")
+        .map((row: Record<string, unknown>) => String(row.id))
+        .slice(0, limit - legacy.length);
+      for (const id of whitespaceIds) {
+        const full = await this.table!
+          .query()
+          .where(`id = '${escapeSqlLiteral(id)}'`)
+          .limit(1)
+          .toArray();
+        if (full.length > 0) {
+          legacy.push(this.materializeLegacyScopeRow(full[0] as Record<string, unknown>));
+        }
+      }
+    }
+    return legacy;
+  }
+
+  async repairLegacyScopes(targetScope: string): Promise<{ repaired: number; failed: number; skipped: number; unrecovered: MemoryEntry[] }> {
+    if (!hasValidEntryScope(targetScope)) {
+      throw new Error("repairLegacyScopes requires a non-empty target scope");
+    }
+    const legacyRows = await this.findLegacyScopeRows(100000);
+    let repaired = 0;
+    let failed = 0;
+    let skipped = 0;
+    const unrecovered: MemoryEntry[] = [];
+    // A systemic failure (version refresh unavailable, lock unacquirable,
+    // storage errors) must be distinguishable from per-row races: log the
+    // per-row reason (bounded), and stop hammering the cross-process lock
+    // once failures are clearly not row-specific. Unattempted rows stay
+    // legacy, so a later run rediscovers them.
+    const MAX_LOGGED_FAILURES = 20;
+    const MAX_CONSECUTIVE_FAILURES = 10;
+    let consecutiveFailures = 0;
+    for (const candidate of legacyRows) {
+      try {
+        const outcome = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+          // The discovery snapshot can go stale before this row's turn under
+          // the lock: re-read and repair only a row whose stored scope is
+          // still legacy, from its current content. A concurrent write must
+          // be neither overwritten with the snapshot nor reassigned to the
+          // target scope, and a concurrently deleted row must not be
+          // resurrected.
+          //
+          // The lock serializes writers; it does NOT advance this handle's
+          // cached table version, so a re-read through a stale handle can
+          // still validate against a snapshot that predates another
+          // connection's update. Check out the latest version under the lock
+          // before validating. If the refresh fails, this throw fails the row
+          // (reported in `failed`) instead of writing from a stale snapshot.
+          await this.table!.checkoutLatest();
+          const safeId = escapeSqlLiteral(candidate.id);
+          const currentRows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();
+          if (currentRows.length === 0) return "skipped" as const;
+          const currentRaw = currentRows[0] as Record<string, unknown>;
+          const currentScope = currentRaw.scope as string | null | undefined;
+          // Whitespace-only counts as still-legacy, matching the discovery
+          // query and the public write validator.
+          if (currentScope != null && currentScope.trim() !== "") return "skipped" as const;
+          const row = this.materializeLegacyScopeRow(currentRaw);
+          const replacement: MemoryEntry = { ...row, scope: targetScope.trim() };
+          await this.table!.delete(`id = '${safeId}'`);
+          try {
+            await this.table!.add([this.toRow(replacement)]);
+          } catch (addError) {
+            // Commit-then-reject: the add can persist and STILL surface an
+            // error (post-commit step failure, retried conflict where the
+            // retry landed). Re-read before rolling back — blindly re-adding
+            // the original would leave two rows under the same id.
+            let landed: Record<string, unknown> | null = null;
+            try {
+              const postRows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();
+              landed = postRows.length > 0 ? (postRows[0] as Record<string, unknown>) : null;
+            } catch {
+              landed = null;
+            }
+            const landedScope = typeof landed?.scope === "string" ? (landed.scope as string).trim() : "";
+            if (landedScope === targetScope.trim()) {
+              return "repaired" as const;
+            }
+            if (landed === null) {
+              try {
+                await this.table!.add([this.toRow({ ...row })]);
+              } catch {
+                // The rollback write shares the replacement add's
+                // commit-then-reject hazard: it can persist and still error.
+                // Confirm absence before declaring the row lost; a failed
+                // confirmation read stays fail-closed and still reports it.
+                let rolledBack = false;
+                try {
+                  const rollbackRows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();
+                  rolledBack = rollbackRows.length > 0;
+                } catch {
+                  rolledBack = false;
+                }
+                if (!rolledBack) {
+                  // Both writes genuinely failed after the delete, so the row
+                  // is no longer in the table. Surface its full content to the
+                  // caller instead of silently losing the data.
+                  unrecovered.push({ ...row });
+                }
+              }
+            }
+            throw addError;
+          }
+          return "repaired" as const;
+        }));
+        if (outcome === "repaired") repaired += 1;
+        else skipped += 1;
+        consecutiveFailures = 0;
+      } catch (rowError) {
+        failed += 1;
+        consecutiveFailures += 1;
+        if (failed <= MAX_LOGGED_FAILURES) {
+          console.warn(
+            `repairLegacyScopes: row ${String(candidate.id).slice(0, 8)} failed: ${rowError instanceof Error ? rowError.message : String(rowError)}`,
+          );
+        } else if (failed === MAX_LOGGED_FAILURES + 1) {
+          console.warn("repairLegacyScopes: further per-row failure logs suppressed");
+        }
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          const unattempted = legacyRows.length - repaired - failed - skipped;
+          console.error(
+            `repairLegacyScopes: aborting after ${consecutiveFailures} consecutive failures — the cause looks systemic, not row-specific. ` +
+            `${unattempted} row(s) unattempted; they remain legacy and discoverable by the next run. ` +
+            `Last failure: ${rowError instanceof Error ? rowError.message : String(rowError)}`,
+          );
+          break;
+        }
+      }
+    }
+    if (repaired > 0) this.noteDataModification();
+    return { repaired, failed, skipped, unrecovered };
+  }
+
+
+  /**
+   * Force the open table handle onto the latest committed version. A nonzero
+   * readConsistencyInterval lets reads serve a snapshot up to that many
+   * seconds stale; a locked read-modify-write section must observe every
+   * commit that preceded its lock acquisition, so it re-syncs first. A sync
+   * failure propagates: proceeding on a possibly-stale snapshot would
+   * silently reintroduce the staleness this guard exists to close.
+   */
+  private async syncTableToLatest(): Promise<void> {
+    const table = this.table as unknown as { checkoutLatest?: () => Promise<void> } | null;
+    if (table && typeof table.checkoutLatest === "function") {
+      await table.checkoutLatest();
+    }
+  }
+
+  /**
+   * Atomic supersede-and-store: re-discovers the target rows, inserts the new
+   * row, and invalidates every confirmed target inside ONE write-lock +
+   * serialized-update section. The caller's advisory discovery only decides
+   * whether to enter this path; the target set that actually commits is the
+   * one discovered here, so two concurrent same-key writers converge on a
+   * single active row (the second writer's recheck sees the first writer's
+   * replacement and supersedes it) instead of leaving both replacements
+   * standing.
+   *
+   * Only CONFIRMED invalidations are reported in supersededIds; a null or
+   * throwing patch lands in invalidationFailures instead of being silently
+   * counted as success.
+   */
+  async storeSuperseding(options: {
+    entry: Omit<MemoryEntry, "id" | "timestamp">;
+    discoverTargets: () => Promise<MemoryEntry[]>;
+    finalizeEntryMetadata?: (targets: MemoryEntry[]) => string;
+    buildTargetPatch: (target: MemoryEntry, newEntryId: string) => MetadataPatch;
+    scopeFilter?: string[];
+  }): Promise<{
+    entry: MemoryEntry;
+    supersededIds: string[];
+    invalidationFailures: Array<{ id: string; reason: string }>;
+  }> {
+    await this.ensureInitialized();
+    const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      // The cross-process lock serializes writers but does not refresh this
+      // handle's read snapshot: with a second store instance and a nonzero
+      // readConsistencyInterval, the locked re-discovery could miss the
+      // preceding writer's commit and leave both replacements active.
+      await this.syncTableToLatest();
+      const targets = await options.discoverTargets();
+
+      const fullEntry: MemoryEntry = {
+        ...options.entry,
+        id: randomUUID(),
+        timestamp: Date.now(),
+        metadata: options.finalizeEntryMetadata
+          ? options.finalizeEntryMetadata(targets)
+          : options.entry.metadata || "{}",
+        importance: clampImportance(Number(options.entry.importance)),
+      } as MemoryEntry;
+      await this.table!.add([this.toRow(fullEntry)]);
+
+      const supersededIds: string[] = [];
+      const invalidationFailures: Array<{ id: string; reason: string }> = [];
+      for (const target of targets) {
+        try {
+          const existing = await this.getById(target.id, options.scopeFilter);
+          if (!existing) {
+            invalidationFailures.push({
+              id: target.id,
+              reason: "row not found or outside accessible scopes at commit time",
+            });
+            continue;
+          }
+          const metadata = buildSmartMetadata(existing, options.buildTargetPatch(existing, fullEntry.id));
+          const updated = await this.performUpdateLocked(
+            target.id,
+            { metadata: stringifySmartMetadata(metadata) },
+            options.scopeFilter,
+          );
+          if (updated == null) {
+            invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
+          } else {
+            supersededIds.push(target.id);
+          }
+        } catch (err) {
+          invalidationFailures.push({
+            id: target.id,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      return { entry: fullEntry, supersededIds, invalidationFailures };
+    }));
+    this.noteDataModification();
+    return result;
+  }
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {
     await this.ensureInitialized();
 
@@ -2085,7 +3499,7 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    return this.runWithFileLock(async () => {
+    return this.runWithWriteLock(async () => {
       // Count first
       const countResults = await this.table!.query().where(whereClause).toArray();
       const deleteCount = countResults.length;
@@ -2114,6 +3528,7 @@ export class MemoryStore {
       const indices = await this.table.listIndices();
       const available = hasFtsIndex(indices);
       this.ftsIndexCreated = available;
+      this.ftsColumn = preferredFtsColumn(indices) ?? this.ftsColumn;
       if (available) this._lastFtsError = null;
       return available;
     } catch (err) {
@@ -2129,6 +3544,74 @@ export class MemoryStore {
   }
 
   /** Get FTS index health status */
+  private async tableHasSearchTextColumn(table: LanceDB.Table): Promise<boolean> {
+    try {
+      const schema = await table.schema();
+      return schema.fields.some((field: { name: string }) => field.name === SEARCH_TEXT_COLUMN);
+    } catch {
+      return false;
+    }
+  }
+
+  // Every row reaching the table gets its BM25 source recomputed from the
+  // abstract and the summary layers, so no rewrite path can let it drift.
+  private toRow<T extends { text: string; metadata?: string | null }>(entry: T): T {
+    if (!this.searchTextColumnReady) {
+      if (!(SEARCH_TEXT_COLUMN in entry)) return entry;
+      const stripped: Record<string, unknown> = { ...entry };
+      delete stripped[SEARCH_TEXT_COLUMN];
+      return stripped as T;
+    }
+    return { ...entry, [SEARCH_TEXT_COLUMN]: buildSearchText(entry.text, entry.metadata) };
+  }
+
+  private async backfillSearchTextRows(
+    table: LanceDB.Table,
+    options: { dryRun?: boolean; batchSize?: number } = {},
+  ): Promise<{ scanned: number; stale: number; updated: number }> {
+    const dryRun = options.dryRun ?? false;
+    const batchSize = clampInt(options.batchSize ?? 200, 1, 1000);
+    const summaries = await table.query().select(["id", "text", "metadata", SEARCH_TEXT_COLUMN]).toArray();
+    const staleIds: string[] = [];
+    for (const row of summaries) {
+      const expected = buildSearchText(String(row.text ?? ""), row.metadata as string | null | undefined);
+      if (row[SEARCH_TEXT_COLUMN] !== expected) staleIds.push(String(row.id));
+    }
+    let updated = 0;
+    if (!dryRun) {
+      for (let start = 0; start < staleIds.length; start += batchSize) {
+        const ids = staleIds.slice(start, start + batchSize);
+        const where = ids.map((id) => `id = '${escapeSqlLiteral(id)}'`).join(" OR ");
+        const rows = await table.query().where(`(${where})`).toArray();
+        const rewritten = rows.map((row) => ({
+          ...row,
+          vector: Array.from(row.vector as Iterable<number>),
+          [SEARCH_TEXT_COLUMN]: buildSearchText(String(row.text ?? ""), row.metadata as string | null | undefined),
+        }));
+        if (rewritten.length === 0) continue;
+        await table.mergeInsert("id").whenMatchedUpdateAll().execute(rewritten);
+        updated += rewritten.length;
+      }
+    }
+    return { scanned: summaries.length, stale: staleIds.length, updated };
+  }
+
+  /** Report (or with dryRun=false rewrite) rows whose BM25 source column is missing or stale. */
+  async backfillSearchText(
+    options: { dryRun?: boolean; batchSize?: number } = {},
+  ): Promise<{ scanned: number; stale: number; updated: number }> {
+    await this.ensureInitialized();
+    if (!this.searchTextColumnReady) {
+      throw new Error(`${SEARCH_TEXT_COLUMN} column is missing: the table schema migration did not run`);
+    }
+    const result = await this.runWithWriteLock(async () => {
+      await this.checkoutLatestTableForWrite();
+      return this.backfillSearchTextRows(this.table!, options);
+    });
+    if (result.updated > 0) this.noteDataModification();
+    return result;
+  }
+
   getFtsStatus(): { available: boolean; lastError: string | null } {
     return {
       available: this.ftsIndexCreated,
@@ -2140,19 +3623,39 @@ export class MemoryStore {
   async rebuildFtsIndex(): Promise<{ success: boolean; error?: string }> {
     await this.ensureInitialized();
     try {
-      // Drop existing FTS index if any
-      const indices = await this.table!.listIndices();
-      for (const idx of indices) {
-        if (idx.indexType === "FTS" || idx.columns?.includes("text")) {
+      await this.runWithWriteLock(async () => {
+        // Drop existing FTS index if any. A failed drop is a failed rebuild:
+        // the surviving index makes the creation below a no-op, so reporting
+        // success would claim a rebuild that never happened. Dropping stops
+        // at the FIRST failure instead of continuing to widen the damage,
+        // and any index already dropped is compensated by recreating the FTS
+        // index before the error propagates, so a partial drop can never
+        // leave the store without full-text search.
+        const indices = await this.table!.listIndices();
+        const matching = indices.filter(isFtsIndex);
+        let dropped = 0;
+        for (const idx of matching) {
+          const indexName = ftsIndexName(idx);
           try {
-            await this.table!.dropIndex((idx as any).name || "text");
+            await this.table!.dropIndex(indexName);
+            dropped += 1;
           } catch (err) {
-            console.warn(`memory-lancedb-pro: dropIndex(${(idx as any).name || "text"}) failed:`, err);
+            const dropError = `dropIndex(${indexName}): ${err instanceof Error ? err.message : String(err)}`;
+            let compensation = "";
+            if (dropped > 0) {
+              try {
+                await this.createFtsIndex(this.table!);
+                compensation = `; recreated the FTS index to compensate ${dropped} already-dropped index(es)`;
+              } catch (compensationErr) {
+                compensation = `; compensation failed, the FTS index may be missing: ${compensationErr instanceof Error ? compensationErr.message : String(compensationErr)}`;
+              }
+            }
+            throw new Error(dropError + compensation);
           }
         }
-      }
-      // Recreate
-      await this.createFtsIndex(this.table!);
+        // Recreate
+        await this.createFtsIndex(this.table!);
+      });
       this.ftsIndexCreated = true;
       this._lastFtsError = null;
       return { success: true };
@@ -2174,8 +3677,13 @@ export class MemoryStore {
     maxTimestamp: number,
     scopeFilter?: string[],
     limit = 200,
+    options?: { excludeInactive?: boolean },
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
+
+    // An explicitly empty scope filter is a deny-all contract, matching the
+    // other scoped readers: compaction must never widen into every scope.
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const conditions: string[] = [timestampBeforePredicate("timestamp", maxTimestamp)];
 
@@ -2183,29 +3691,143 @@ export class MemoryStore {
       const scopeConditions = scopeFilter
         .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
         .join(" OR ");
-      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+      // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+      // would make every such row visible to every agent's scope filter. Do not pass them.
+      conditions.push(`(${scopeConditions})`);
     }
 
     const whereClause = conditions.join(" AND ");
 
-    const results = await this.table!
-      .query()
-      .where(whereClause)
-      .toArray();
+    // Two-phase read so the scan limit actually bounds materialization: the
+    // full-table pass fetches ONLY the light columns needed to rank and
+    // filter (no vector column crosses the wire), and the heavy rows --
+    // vectors included -- are fetched afterwards for just the `limit` newest
+    // survivors. A full .toArray() with vectors converted for every matching
+    // row spikes the heap on exactly the large stores the limit exists for.
+    // Routed through the same projection fallback as list()/stats(): on the
+    // LanceDB versions that return an empty projected metadata read for a
+    // populated table, a bare .select() here makes consolidate report
+    // "Scanned 0 rows" and silently do nothing.
+    const lightRows = await this.queryRowsWithProjectionFallback(
+      (query: any) => query.where(whereClause),
+      ["id", "timestamp", "metadata"],
+    );
 
-    return results
-      .slice(0, limit)
-      .map(
-        (row): MemoryEntry => ({
-          id: row.id as string,
+    // excludeInactive keeps the pre-#946 default (false); the consolidate
+    // CLI opts in to live-only explicitly.
+    const excludeInactive = options?.excludeInactive ?? false;
+    const ranked = lightRows
+      .map((row) => ({
+        id: row.id as string,
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+        metadata: (row.metadata as string) || "{}",
+      }))
+      .filter((row) =>
+        excludeInactive ? isMemoryActiveAt(parseSmartMetadata(row.metadata, { id: row.id } as MemoryEntry)) : true,
+      )
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit);
+
+    if (ranked.length === 0) return [];
+
+    const entriesById = new Map<string, MemoryEntry>();
+    const ID_CHUNK = 500;
+    for (let i = 0; i < ranked.length; i += ID_CHUNK) {
+      const chunk = ranked.slice(i, i + ID_CHUNK);
+      const idList = chunk.map((row) => `'${escapeSqlLiteral(row.id)}'`).join(", ");
+      const fullRows = await this.table!
+        .query()
+        .where(`${whereClause} AND id IN (${idList})`)
+        .toArray();
+      for (const row of fullRows) {
+        const id = row.id as string;
+        const timestamp = normalizeMemoryTimestamp(row.timestamp, 0);
+        const metadata = (row.metadata as string) || "{}";
+        // Re-judged on the FRESH metadata: a row invalidated between the two
+        // passes cleared the light filter but must not enter consolidation live.
+        if (excludeInactive && !isMemoryActiveAt(parseSmartMetadata(metadata, { id, timestamp } as MemoryEntry))) continue;
+        entriesById.set(id, {
+          id,
           text: row.text as string,
-          vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
+          vector: toNumberVector(row.vector),
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
-          importance: Number(row.importance),
-          timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-          metadata: (row.metadata as string) || "{}",
-        }),
-      );
+          importance: clampImportance(Number(row.importance)),
+          timestamp,
+          metadata,
+        });
+      }
+    }
+
+    // Order and membership come from the ranked light pass; a row deleted (or,
+    // under excludeInactive, invalidated) between the two passes simply drops out.
+    return ranked
+      .map((row) => entriesById.get(row.id))
+      .filter((entry): entry is MemoryEntry => entry !== undefined);
   }
+
+  /**
+   * Atomic read-decide-patch on one row's metadata. The row is re-read UNDER
+   * the write lock and the caller's transform decides from that fresh state:
+   * returning null commits nothing (the row no longer needs the change), and
+   * a returned patch is merged onto the CURRENT metadata rather than
+   * replacing it wholesale, so unrelated fields written by concurrent
+   * writers survive. This is the safe path for maintenance passes whose scan
+   * ran before the lock: deciding from the scan snapshot and writing a
+   * document built from it silently reverts every update that landed between
+   * scan and apply.
+   */
+  async transformMetadata(
+    id: string,
+    transform: (current: MemoryEntry) => MetadataPatch | null,
+    scopeFilter?: string[],
+  ): Promise<{ outcome: "updated" | "unchanged" | "missing"; entry: MemoryEntry | null }> {
+    await this.ensureInitialized();
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
+    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      // The lock serializes writers but does not advance this handle's cached
+      // table version: read the current row through the latest version, or a
+      // concurrent connection's write between scan and apply gets overwritten
+      // from a stale snapshot.
+      await this.checkoutLatestTableForWrite();
+      const current = await this.getById(id, scopeFilter);
+      if (!current) {
+        return { outcome: "missing" as const, entry: null };
+      }
+      const patch = transform(current);
+      if (!patch) {
+        return { outcome: "unchanged" as const, entry: current };
+      }
+      // Surgical raw-metadata merge: only the callback's explicit keys change,
+      // every unrelated field AND absence survives verbatim. Routing through
+      // buildSmartMetadata here would materialize unrelated classification,
+      // lifecycle, counter, and timestamp defaults; a legacy row would gain
+      // memory_category and silently stop being upgrader-eligible.
+      let raw: Record<string, unknown>;
+      try {
+        const parsed: unknown = current.metadata ? JSON.parse(current.metadata) : {};
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("non-object metadata");
+        }
+        raw = parsed as Record<string, unknown>;
+      } catch {
+        throw new Error(`Memory ${id} carries unparseable metadata; refusing a raw metadata transform`);
+      }
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === undefined) continue;
+        raw[key] = value;
+      }
+      const entry = await this.performUpdateLocked(
+        current.id,
+        { metadata: JSON.stringify(raw) },
+        scopeFilter,
+      );
+      return entry
+        ? { outcome: "updated" as const, entry }
+        : { outcome: "missing" as const, entry: null };
+    }));
+  }
+
 }

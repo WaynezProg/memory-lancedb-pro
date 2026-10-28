@@ -16,6 +16,7 @@ const ENV_KEYS = [
   "MEMORY_PRO_OAUTH_REDIRECT_URI",
   "MEMORY_PRO_OAUTH_CLIENT_ID",
   "OPENCLAW_HOME",
+  "OPENCLAW_STATE_DIR",
 ];
 
 function encodeSegment(value) {
@@ -388,6 +389,7 @@ describe("memory-pro auth", () => {
     process.env.MEMORY_PRO_OAUTH_TOKEN_URL = `http://127.0.0.1:${tokenPort}/oauth/token`;
     process.env.MEMORY_PRO_OAUTH_REDIRECT_URI = `http://localhost:${redirectPort}/auth/callback`;
     process.env.MEMORY_PRO_OAUTH_CLIENT_ID = "test-client-id";
+    delete process.env.OPENCLAW_STATE_DIR;
     process.env.OPENCLAW_HOME = path.join(tempDir, "openclaw-home");
 
     const configPath = path.join(tempDir, "openclaw.json");

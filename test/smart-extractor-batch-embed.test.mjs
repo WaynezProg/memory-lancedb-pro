@@ -95,6 +95,7 @@ function makeStore() {
     },
     async update(_id, _patch, _scopeFilter) {
       entries.push({ action: "update", id: _id });
+      return { id: _id };
     },
     async getById(_id, _scopeFilter) {
       return null;
@@ -193,6 +194,59 @@ describe("SmartExtractor batch embedding paths", () => {
     // embed() should NOT have been called (batch path used instead)
     assert.strictEqual(calls.embed, 0,
       `Expected 0 embed calls (batch path), got ${calls.embed}`);
+  });
+
+  it("filters meta-frustration text before smart extraction embedding", async () => {
+    const { embedder, calls } = makeCountingEmbedder();
+    const llm = makeLlm([]);
+    const store = makeStore();
+    const extractor = makeExtractor(embedder, llm, store);
+
+    const inputTexts = [
+      "you never remember anything I say",
+      "did you get what i said",
+      "what just changed?",
+      "My favorite editor is Zed because it keeps the interface quiet.",
+    ];
+
+    const result = await extractor.filterNoiseByEmbedding(inputTexts);
+
+    assert.deepStrictEqual(result, [
+      "My favorite editor is Zed because it keeps the interface quiet.",
+    ]);
+    assert.strictEqual(calls.embedBatch, 0, "static filter should not call embedBatch without a noise bank");
+    assert.strictEqual(calls.embed, 0, "static filter should not call embed without a noise bank");
+  });
+
+  it("reports surviving input indices through both filter stages", async () => {
+    const { embedder } = makeCountingEmbedder();
+    const llm = makeLlm([]);
+    const store = makeStore();
+
+    const noiseBank = {
+      initialized: true,
+      // The mock embedder encodes the first char code at vector position 0.
+      isNoise(vec) {
+        return vec.length > 0 && vec[0] === "N".charCodeAt(0) / 255;
+      },
+      learn(_vec) {},
+    };
+    const extractor = makeExtractor(embedder, llm, store, { noiseBank });
+
+    const inputTexts = [
+      "you never remember anything I say", // static noise -> dropped
+      "My favorite editor is Zed because it keeps the interface quiet.", // embedded, kept
+      "N" + "x".repeat(40), // embedded, flagged as noise -> dropped
+      "ok", // short bypass, kept
+    ];
+
+    const { texts, keptIndices } =
+      await extractor.filterNoiseByEmbeddingWithIndices(inputTexts);
+    assert.deepStrictEqual(texts, [
+      "My favorite editor is Zed because it keeps the interface quiet.",
+      "ok",
+    ]);
+    assert.deepStrictEqual(keptIndices, [1, 3]);
   });
 
   // --------------------------------------------------------------------------
@@ -357,7 +411,7 @@ describe("SmartExtractor batch embedding paths", () => {
   // --------------------------------------------------------------------------
   // Test 7: Profile candidates are excluded from batch pre-computation
   // --------------------------------------------------------------------------
-  it("excludes profile-category candidates from batch pre-computation (Step 2)", async () => {
+  it("routes profile candidates through batch pre-computation too (batched-utility contract)", async () => {
     // Track all embedBatch calls to distinguish Step 1b (dedup) from Step 2 (pre-compute)
     const allBatchCalls = [];
     const embedder = {
@@ -392,13 +446,14 @@ describe("SmartExtractor batch embedding paths", () => {
       call.some((t) => t.includes("用户基本画像") || t.includes("画像信息")),
     );
 
-    // Step 1b dedup MAY include profile abstract (that's expected).
-    // But Step 2 pre-compute MUST exclude it.
-    // With a single profile candidate, we expect at most 1 call that includes
-    // profile text (the Step 1b dedup call). If there are more, that's a bug.
+    // Batched-utility contract: Step 2 pre-computes vectors for EVERY
+    // processable candidate, profile included, because the batched
+    // utility/admission call consumes the precomputed vector. One profile
+    // candidate therefore legitimately appears in Step 1b dedup AND the
+    // Step 2 pre-compute batch.
     assert.ok(
-      profileTexts.length <= 1,
-      `Only Step 1b dedup may include profile text, but got ${profileTexts.length} calls with profile text`,
+      profileTexts.length >= 1 && profileTexts.length <= 2,
+      `Expected profile text in dedup and batch pre-compute, got ${profileTexts.length} calls`,
     );
   });
 });

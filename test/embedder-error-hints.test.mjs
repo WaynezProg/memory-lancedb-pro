@@ -100,25 +100,47 @@ async function expectReject(promiseFactory, pattern) {
   }
 }
 
+async function expectVoyagePayload(config, callEmbedder, assertPayload, dimensions = 1024) {
+  await withEmbeddingCaptureServer(
+    (payload) => {
+      assertPayload(payload);
+      const inputs = Array.isArray(payload.input) ? payload.input : [payload.input];
+      return {
+        body: {
+          data: inputs.map((_, index) => ({
+            object: "embedding",
+            index,
+            embedding: new Array(dimensions).fill(0.2),
+          })),
+        },
+      };
+    },
+    async ({ baseURL }) => {
+      const embedder = new Embedder({
+        provider: "openai-compatible",
+        apiKey: "test-key",
+        ...config,
+        baseURL,
+      });
+      await callEmbedder(embedder);
+    },
+  );
+}
+
 async function run() {
   assert.equal(getVectorDimensions("voyage-4-lite"), 1024);
   assert.equal(getVectorDimensions("voyage-3-large"), 1024);
   assert.equal(getVectorDimensions("bge-m3"), 1024);
   assert.equal(getVectorDimensions("BAAI/bge-m3"), 1024);
 
-  const voyageEmbedder = new Embedder({
-    provider: "openai-compatible",
-    apiKey: "test-key",
-    model: "voyage-3-lite",
-    baseURL: "https://api.voyageai.com/v1",
-    dimensions: 1024,
-  });
-  installMockEmbeddingClient(voyageEmbedder, async (payload) => {
-    assert.notEqual(payload.encoding_format, "float");
-    assert.equal(payload.dimensions, undefined);
-    return createEmbeddingResponse(1024);
-  });
-  await voyageEmbedder.embedPassage("hello");
+  await expectVoyagePayload(
+    { model: "voyage-3-lite", dimensions: 1024 },
+    (embedder) => embedder.embedPassage("hello"),
+    (payload) => {
+      assert.equal(payload.encoding_format, undefined, "voyage should not send encoding_format");
+      assert.equal(payload.dimensions, undefined, "voyage should not send dimensions");
+    },
+  );
 
   const jinaEmbedder = new Embedder({
     provider: "openai-compatible",
@@ -151,61 +173,211 @@ async function run() {
   });
   await genericEmbedder.embedPassage("hello");
 
-  // voyage-4 should be detected as voyage-compatible via model name prefix,
-  // even when baseURL is NOT api.voyageai.com (e.g. behind a proxy).
-  const voyageProxyEmbedder = new Embedder({
+  const qwen3DefaultQueryTask =
+    "Given a memory search query, retrieve relevant stored knowledge entries that match the query";
+  const qwen3Embedder = new Embedder({
     provider: "openai-compatible",
     apiKey: "test-key",
-    model: "voyage-4",
-    baseURL: "https://proxy.example.invalid/v1",
-    dimensions: 1024,
+    model: "/models/Qwen3-Embedding-8B",
+    baseURL: "https://vllm.example.invalid/v1",
+    dimensions: 4096,
   });
-  installMockEmbeddingClient(voyageProxyEmbedder, async (payload) => {
-    assert.notEqual(payload.encoding_format, "float", "voyage-4 should not send encoding_format");
-    assert.equal(payload.dimensions, undefined, "voyage-4 should not send dimensions");
-    return createEmbeddingResponse(1024);
+
+  installMockEmbeddingClient(qwen3Embedder, async (payload) => {
+    assert.equal(
+      payload.input,
+      `Instruct: ${qwen3DefaultQueryTask}\nQuery:PlayerAction`,
+      "Qwen3 query embeddings should use the recommended query instruction prefix",
+    );
+    assert.equal(payload.task, undefined, "generic Qwen3 endpoints should not receive a task payload field");
+    return createEmbeddingResponse(4096);
   });
-  await voyageProxyEmbedder.embedPassage("hello");
+  await qwen3Embedder.embedQuery("PlayerAction");
+
+  installMockEmbeddingClient(qwen3Embedder, async (payload) => {
+    assert.equal(payload.input, "PlayerAction schema", "Qwen3 passage embeddings should remain raw");
+    return createEmbeddingResponse(4096);
+  });
+  await qwen3Embedder.embedPassage("PlayerAction schema");
+
+  const qwen3CustomTaskEmbedder = new Embedder({
+    provider: "openai-compatible",
+    apiKey: "test-key",
+    model: "Qwen3_Embedding_8B",
+    baseURL: "https://vllm.example.invalid/v1",
+    dimensions: 4096,
+    taskQuery: "Retrieve relevant project memories.",
+  });
+  installMockEmbeddingClient(qwen3CustomTaskEmbedder, async (payload) => {
+    assert.deepEqual(payload.input, [
+      "Instruct: Retrieve relevant project memories.\nQuery:PlayerAction",
+      "Instruct: Retrieve relevant project memories.\nQuery:DimPlayerAction",
+    ]);
+    assert.equal(payload.task, undefined, "taskQuery should be used as prefix text, not sent as a generic task field");
+    return {
+      data: [
+        { object: "embedding", index: 0, embedding: new Array(4096).fill(0.1) },
+        { object: "embedding", index: 1, embedding: new Array(4096).fill(0.2) },
+      ],
+    };
+  });
+  await qwen3CustomTaskEmbedder.embedBatchQuery(["PlayerAction", "DimPlayerAction"]);
+
+  // voyage-4 should be detected as voyage-compatible via model name prefix,
+  // even when baseURL is NOT api.voyageai.com (e.g. behind a proxy).
+  await expectVoyagePayload(
+    { model: "voyage-4", dimensions: 1024 },
+    (embedder) => embedder.embedPassage("hello"),
+    (payload) => {
+      assert.equal(payload.encoding_format, undefined, "voyage-4 should not send encoding_format");
+      assert.equal(payload.dimensions, undefined, "voyage-4 should not send dimensions");
+    },
+  );
 
   // Voyage: taskPassage "retrieval.passage" → input_type "document"
   //         taskQuery  "retrieval.query"   → input_type "query"
-  const voyageTaskEmbedder = new Embedder({
-    provider: "openai-compatible",
-    apiKey: "test-key",
-    model: "voyage-3-lite",
-    baseURL: "https://api.voyageai.com/v1",
-    dimensions: 1024,
-    taskPassage: "retrieval.passage",
-    taskQuery: "retrieval.query",
-  });
-  installMockEmbeddingClient(voyageTaskEmbedder, async (payload) => {
-    assert.equal(payload.input_type, "document", "voyage taskPassage should map to input_type=document");
-    assert.equal(payload.task, undefined, "voyage should not send task field");
-    return createEmbeddingResponse(1024);
-  });
-  await voyageTaskEmbedder.embedPassage("hello");
+  await expectVoyagePayload(
+    {
+      model: "voyage-3-lite",
+      dimensions: 1024,
+      taskPassage: "retrieval.passage",
+      taskQuery: "retrieval.query",
+    },
+    (embedder) => embedder.embedPassage("hello"),
+    (payload) => {
+      assert.equal(payload.input_type, "document", "voyage taskPassage should map to input_type=document");
+      assert.equal(payload.task, undefined, "voyage should not send task field");
+    },
+  );
 
-  installMockEmbeddingClient(voyageTaskEmbedder, async (payload) => {
-    assert.equal(payload.input_type, "query", "voyage taskQuery should map to input_type=query");
-    return createEmbeddingResponse(1024);
-  });
-  await voyageTaskEmbedder.embedQuery("hello");
+  await expectVoyagePayload(
+    {
+      model: "voyage-3-lite",
+      dimensions: 1024,
+      taskPassage: "retrieval.passage",
+      taskQuery: "retrieval.query",
+    },
+    (embedder) => embedder.embedQuery("hello"),
+    (payload) => {
+      assert.equal(payload.input_type, "query", "voyage taskQuery should map to input_type=query");
+    },
+  );
+
+  await expectVoyagePayload(
+    { model: "voyage-4", dimensions: 1024, taskPassage: "passage" },
+    (embedder) => embedder.embedPassage("hello"),
+    (payload) => {
+      assert.equal(payload.input_type, "document", "voyage taskPassage=passage should map to input_type=document");
+    },
+  );
 
   // Voyage: configured dimensions should be sent as output_dimension, not dimensions.
   // voyage-4-lite is a recommended Voyage model that supports output_dimension.
-  const voyageDimEmbedder = new Embedder({
-    provider: "openai-compatible",
-    apiKey: "test-key",
-    model: "voyage-4-lite",
-    baseURL: "https://api.voyageai.com/v1",
-    requestDimensions: 512,
-  });
-  installMockEmbeddingClient(voyageDimEmbedder, async (payload) => {
-    assert.equal(payload.output_dimension, 512, "voyage should send output_dimension");
-    assert.equal(payload.dimensions, undefined, "voyage should not send dimensions");
-    return createEmbeddingResponse(512);
-  });
-  await voyageDimEmbedder.embedPassage("hello");
+  await expectVoyagePayload(
+    { model: "voyage-4-lite", requestDimensions: 512 },
+    (embedder) => embedder.embedPassage("hello"),
+    (payload) => {
+      assert.equal(payload.output_dimension, 512, "voyage should send output_dimension");
+      assert.equal(payload.dimensions, undefined, "voyage should not send dimensions");
+    },
+    512,
+  );
+
+  // End-to-end HTTP payload verification for Voyage-compatible models through
+  // the native Voyage path. The local server uses a proxy-like baseURL, so this
+  // exercises model-prefix detection while capturing the serialized body.
+  await withEmbeddingCaptureServer(
+    (payload) => {
+      assert.equal(payload.model, "voyage-4-large");
+      assert.deepEqual(payload.input, ["hello voyage"]);
+      assert.equal(payload.input_type, "document", "voyage passage task should be sent as document");
+      assert.equal(payload.output_dimension, 512, "voyage should send output_dimension");
+      assert.equal(payload.encoding_format, undefined, "voyage should not send OpenAI encoding_format");
+      assert.equal(payload.dimensions, undefined, "voyage should not send OpenAI dimensions");
+      assert.equal(payload.task, undefined, "voyage should not send Jina task field");
+      assert.equal(payload.normalized, undefined, "voyage should not send Jina normalized field");
+      return {
+        body: {
+          data: payload.input.map((_, index) => ({
+            object: "embedding",
+            index,
+            embedding: new Array(512).fill(0.2),
+          })),
+        },
+      };
+    },
+    async ({ baseURL }) => {
+      const embedder = new Embedder({
+        provider: "openai-compatible",
+        apiKey: "test-key",
+        model: "voyage-4-large",
+        baseURL,
+        requestDimensions: 512,
+        taskPassage: "retrieval.passage",
+      });
+      const embeddings = await embedder.embedBatchPassage(["hello voyage"]);
+      assert.equal(embeddings.length, 1);
+      assert.equal(embeddings[0].length, 512);
+    },
+  );
+
+  // Voyage native fetch must preserve the configured client timeout for batch
+  // calls, since batch embeddings are intentionally not wrapped by the global
+  // per-text timeout.
+  await withEmbeddingCaptureServer(
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return { body: createEmbeddingResponse(1024) };
+    },
+    async ({ baseURL }) => {
+      const embedder = new Embedder({
+        provider: "openai-compatible",
+        apiKey: "test-key",
+        model: "voyage-4",
+        baseURL,
+        clientTimeoutMs: 25,
+      });
+
+      await expectReject(
+        () => embedder.embedBatchPassage(["timeout voyage"]),
+        /aborted|abort/i,
+      );
+    },
+  );
+
+  // Voyage native fetch should use the same retry/key-rotation behavior as the
+  // SDK path when providers respond with overload/rate-limit statuses.
+  {
+    const authorizations = [];
+    await withEmbeddingCaptureServer(
+      (payload, req) => {
+        authorizations.push(req.headers.authorization);
+        if (authorizations.length === 1) {
+          return {
+            status: 503,
+            body: { error: { message: "provider overloaded" } },
+          };
+        }
+
+        assert.deepEqual(payload.input, ["rotate voyage"]);
+        return { body: createEmbeddingResponse(1024, 0.3) };
+      },
+      async ({ baseURL }) => {
+        const embedder = new Embedder({
+          provider: "openai-compatible",
+          apiKey: ["voyage-key-a", "voyage-key-b"],
+          model: "voyage-4",
+          baseURL,
+        });
+
+        const embeddings = await embedder.embedBatchPassage(["rotate voyage"]);
+        assert.equal(embeddings.length, 1);
+        assert.equal(embeddings[0].length, 1024);
+      },
+    );
+
+    assert.deepEqual(authorizations, ["Bearer voyage-key-a", "Bearer voyage-key-b"]);
+  }
 
   // End-to-end HTTP payload verification for generic-openai-compatible profile.
   // Unlike the mock tests above, this spins up a real HTTP server and verifies

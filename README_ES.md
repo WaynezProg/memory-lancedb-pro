@@ -174,7 +174,7 @@ Help me connect this memory plugin with the most user-friendly configuration: ht
 
 Requirements:
 1. Set it as the only active memory plugin
-2. Use Jina for embedding
+2. Use Jina for embedding, and set embedding.taskQuery=retrieval.query and embedding.taskPassage=retrieval.passage
 3. Use Jina for reranker
 4. Use gpt-4o-mini for the smart-extraction LLM
 5. Enable autoCapture, autoRecall, smartExtraction
@@ -756,11 +756,11 @@ Full list: [Contributors](https://github.com/CortexReach/memory-lancedb-pro/grap
 
 ## Star History
 
-<a href="https://star-history.com/#CortexReach/memory-lancedb-pro&Date">
+<a href="https://star-history.dera.page/#CortexReach/memory-lancedb-pro&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=CortexReach/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=CortexReach/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
   </picture>
 </a>
 

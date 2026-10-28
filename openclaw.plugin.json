@@ -24,6 +24,13 @@
       "cliCommand": "memory"
     }
   ],
+  "cliCommands": [
+    {
+      "name": "memory-pro",
+      "description": "Enhanced memory management commands (LanceDB Pro)",
+      "hasSubcommands": true
+    }
+  ],
   "hooks": {
     "allowConversationAccess": true
   },
@@ -49,15 +56,67 @@
                 "minLength": 1
               },
               {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "source",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              {
                 "type": "array",
                 "items": {
-                  "type": "string",
-                  "minLength": 1
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "required": [
+                        "source",
+                        "id"
+                      ],
+                      "properties": {
+                        "source": {
+                          "type": "string",
+                          "enum": [
+                            "env",
+                            "file"
+                          ]
+                        },
+                        "provider": {
+                          "type": "string"
+                        },
+                        "id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      }
+                    }
+                  ]
                 },
                 "minItems": 1
               }
             ],
-            "description": "Single API key or array of keys for round-robin rotation"
+            "description": "Single API key, SecretRef, or array of keys/SecretRefs for round-robin rotation"
           },
           "model": {
             "type": "string"
@@ -91,10 +150,44 @@
             "type": "boolean",
             "description": "Request normalized embeddings when supported by the provider (e.g. Jina v5)"
           },
+          "maxInputChars": {
+            "type": "integer",
+            "minimum": 100,
+            "description": "Maximum characters sent to the embedding provider per request. With automatic chunking enabled, longer documents are split before this cap is applied to each provider request; with chunking disabled, excess text is truncated."
+          },
           "chunking": {
             "type": "boolean",
             "default": true,
             "description": "Enable automatic chunking for documents exceeding embedding context limits"
+          },
+          "astChunking": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Experimental code-boundary-aware chunking for supported code blocks. Disabled by default and falls back to normal chunking when unsupported.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable code-boundary-aware chunking for JavaScript, TypeScript, and Python code blocks"
+              },
+              "languages": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "javascript",
+                    "typescript",
+                    "python"
+                  ]
+                },
+                "default": [
+                  "javascript",
+                  "typescript",
+                  "python"
+                ],
+                "description": "Languages eligible for code-boundary-aware chunking"
+              }
+            }
           },
           "clientTimeoutMs": {
             "type": "integer",
@@ -114,10 +207,117 @@
       "dbPath": {
         "type": "string"
       },
+      "maxInputChars": {
+        "type": "integer",
+        "minimum": 100,
+        "description": "Legacy top-level alias for embedding.maxInputChars."
+      },
+      "storageMaintenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional LanceDB table maintenance for pruning old version snapshots with table.optimize(). Disabled by default.",
+        "properties": {
+          "autoCleanup": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable scheduled LanceDB table.optimize() cleanup."
+              },
+              "intervalHours": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 24,
+                "description": "Hours between scheduled storage maintenance runs."
+              },
+              "retentionDays": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 7,
+                "description": "Keep LanceDB table versions newer than this many days."
+              },
+              "initialDelayMs": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 300000,
+                "description": "Delay before the first storage maintenance run after service start."
+              }
+            }
+          },
+          "readConsistencyIntervalSeconds": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Seconds between checks for LanceDB table updates committed by other processes (e.g. a CLI delete-bulk while this service holds a long-lived read handle). 0 means strong consistency: every read checks for updates."
+          }
+        }
+      },
+      "redisUrl": {
+        "type": "string",
+        "description": "Optional shortcut for enabling Redis distributed write locking. Prefer locking.redis.url for new configs."
+      },
+      "locking": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Optional external locking configuration for high-concurrency or multi-instance deployments.",
+        "properties": {
+          "redis": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Use Redis SET NX PX write locks before mutating LanceDB. When enabled, Redis lock failures fail writes closed instead of falling back to local file locks."
+              },
+              "url": {
+                "type": "string",
+                "description": "Redis connection URL. May include ${ENV_VAR} placeholders."
+              },
+              "keyPrefix": {
+                "type": "string",
+                "default": "memory-lancedb-pro:write-lock",
+                "description": "Prefix for Redis lock keys."
+              },
+              "ttlMs": {
+                "type": "integer",
+                "minimum": 1000,
+                "default": 60000,
+                "description": "Redis lock TTL in milliseconds."
+              },
+              "acquireTimeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 5000,
+                "description": "Maximum time to wait for the Redis lock before failing the write so the caller can retry later."
+              },
+              "retryDelayMs": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50,
+                "description": "Initial Redis lock retry delay in milliseconds. Retries use exponential backoff."
+              },
+              "connectTimeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1000,
+                "description": "Redis connection timeout in milliseconds."
+              }
+            }
+          }
+        }
+      },
       "enableManagementTools": {
         "type": "boolean",
         "default": false,
         "description": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions"
+      },
+      "manualStoreSupersede": {
+        "type": "boolean",
+        "default": false,
+        "description": "Manual-priority store lane: a memory_store that finds a similar existing memory supersedes it instead of being rejected as a duplicate; the manual text always lands verbatim. Off by default to preserve the classic duplicate check."
       },
       "sessionStrategy": {
         "type": "string",
@@ -171,6 +371,13 @@
         "maximum": 60000,
         "default": 5000,
         "description": "Timeout for the entire auto-recall pipeline (embedding + search + rerank) in milliseconds."
+      },
+      "startupCheckTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 120000,
+        "default": 8000,
+        "description": "Outer time budget in milliseconds for each startup health check phase (embedding, retrieval). Raise on hosts where a cold boot exceeds 8 seconds; the checks run after startup and never block the gateway."
       },
       "autoRecallMaxItems": {
         "type": "integer",
@@ -248,6 +455,20 @@
         "default": 4,
         "description": "Minimum conversation messages required before smart extraction runs."
       },
+      "autoCaptureContextTurns": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10,
+        "default": 0,
+        "description": "Rolling context window for auto-capture extraction: how many recent user turns (with their assistant replies) stay in the transcript across extractions as context. 0 disables retention; each extraction then sees only its own call's turns."
+      },
+      "batchChunkSize": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 10,
+        "description": "Per-call chunk bound for the batched pipeline LLM stages: admission utility, dedup decider, and merge writer. Larger bursts split into ceil(N/batchChunkSize) calls. Values above 50 are clamped."
+      },
       "extractMaxChars": {
         "type": "integer",
         "minimum": 256,
@@ -274,13 +495,28 @@
             "default": "balanced",
             "description": "Named admission tuning preset. Explicit admissionControl fields still override the selected preset."
           },
+          "model": {
+            "type": "string",
+            "description": "Optional absolute override: when set, every admission LLM call uses this model, regardless of modelAffinity."
+          },
+          "modelAffinity": {
+            "type": "string",
+            "enum": [
+              "global",
+              "lane"
+            ],
+            "default": "global",
+            "description": "lane routes reflection-mapped admission calls to memoryReflection.model instead of the global llm model; global uses the plugin's global llm model for every lane."
+          },
           "utilityMode": {
             "type": "string",
             "enum": [
               "standalone",
-              "off"
+              "off",
+              "batch"
             ],
-            "default": "standalone"
+            "default": "standalone",
+            "description": "standalone scores each candidate with its own LLM call; batch scores a whole extraction's candidates with one call per chunk of up to 10; off disables utility scoring entirely."
           },
           "rejectThreshold": {
             "type": "number",
@@ -293,6 +529,13 @@
             "minimum": 0,
             "maximum": 1,
             "default": 0.6
+          },
+          "utilityVetoThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.25,
+            "description": "Utility scores at or below this are rejected regardless of the weighted composite (0 disables the veto)"
           },
           "noveltyCandidatePoolSize": {
             "type": "integer",
@@ -444,7 +687,36 @@
             "default": "cross-encoder"
           },
           "rerankApiKey": {
-            "type": "string",
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "source",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ],
             "description": "API key for reranker service (enables cross-encoder reranking)"
           },
           "rerankModel": {
@@ -500,6 +772,29 @@
             "type": "boolean",
             "default": true,
             "description": "Filter out noise memories (agent denials, meta-questions, boilerplate)"
+          },
+          "neighborEnrichment": {
+            "type": "object",
+            "additionalProperties": false,
+            "default": {
+              "enabled": false,
+              "maxPerResult": 2
+            },
+            "description": "Default-off retrieval-time BM25 neighbor enrichment for hybrid search results.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Attach bounded same-scope BM25 neighbors to each top-level hybrid retrieval result."
+              },
+              "maxPerResult": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+                "default": 2,
+                "description": "Maximum supplemental neighbors to attach per top-level result."
+              }
+            }
           },
           "disableNativeCosine": {
             "type": "boolean",
@@ -1174,6 +1469,10 @@
             "type": "string",
             "description": "Optional dedicated agent id used to run reflection generation (for example: memory-distiller)."
           },
+          "model": {
+            "type": "string",
+            "description": "Optional provider/model override used to generate the reflection. Falls back to the reflection agent's primary model, then the plugin llm.model."
+          },
           "messageCount": {
             "type": "integer",
             "minimum": 1,
@@ -1218,12 +1517,24 @@
             "minimum": 0,
             "description": "Cooldown in ms between reflection triggers for the same session. Default: 120000 (2 min). Set to 0 to disable."
           },
+          "maxConcurrentRuns": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 16,
+            "default": 1,
+            "description": "Max concurrent reflection runs across all agents. Defaults to 1, which keeps reflections fully serialized (the previous behavior) while per-agent lanes stop queued runs from burning their timeout budget. Raise to let agents reflect in parallel."
+          },
           "excludeAgents": {
             "type": "array",
             "items": {
               "type": "string"
             },
             "description": "Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. pi-), and temp:*."
+          },
+          "includeGroupChats": {
+            "type": "boolean",
+            "default": true,
+            "description": "Run the reflection distiller for group-chat sessions (session keys carrying a :group: or :channel: segment). Default true; set false to skip reflection generation on group channels."
           }
         }
       },
@@ -1271,7 +1582,36 @@
             "description": "LLM authentication mode. oauth uses the local Codex/ChatGPT login cache instead of llm.apiKey."
           },
           "apiKey": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "source",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            ]
           },
           "model": {
             "type": "string",
@@ -1292,6 +1632,19 @@
             "type": "integer",
             "minimum": 500,
             "default": 30000
+          },
+          "thinkLevel": {
+            "type": "string",
+            "description": "Reasoning effort requested from the model, e.g. low, medium, high. Host transport: always sent with a default of medium, a level that never disables reasoning, because omitting it has been observed to fall through to a disabled/no-reasoning default further down the host-managed runtime stack, silently degrading reasoning-capable models. Direct transport: sent only when explicitly configured; when unset, no reasoning parameter is sent and the provider's own default applies. Deliberately no JSON-schema default here: a schema default gets materialized into the plugin config upstream on at least one OpenClaw host config-loading path, indistinguishably from a genuine user value (the medium default lives in code -- DEFAULT_HOST_REASONING_EFFORT in src/llm-client.ts -- applied only on the host transport when unconfigured)."
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "host"
+            ],
+            "default": "direct",
+            "description": "Completion transport for the LLM lane. direct posts straight to llm.baseURL via the bundled OpenAI-compatible client (default; works standalone and in the CLI). host routes through OpenClaw's host-managed runtime LLM catalog so provider routing, auth profiles, and app attribution apply automatically; falls back to direct with a warning when the host runtime does not expose that surface."
           }
         }
       },
@@ -1428,10 +1781,7 @@
           }
         }
       }
-    },
-    "required": [
-      "embedding"
-    ]
+    }
   },
   "uiHints": {
     "embedding.apiKey": {
@@ -1485,9 +1835,25 @@
       "help": "Request normalized embeddings when the provider supports it (Jina v5). If unset, the field is not sent.",
       "advanced": true
     },
+    "embedding.maxInputChars": {
+      "label": "Max Input Characters",
+      "placeholder": "model-specific default",
+      "help": "Maximum characters sent to the embedding provider per request. Auto-chunking preserves longer documents by splitting first; disabling chunking makes this a truncation cap.",
+      "advanced": true
+    },
+    "maxInputChars": {
+      "label": "Max Input Characters",
+      "help": "Legacy top-level alias for embedding.maxInputChars.",
+      "advanced": true
+    },
     "embedding.chunking": {
       "label": "Auto-Chunk Documents",
       "help": "Automatically split long documents into chunks when they exceed embedding context limits. Enabled by default.",
+      "advanced": true
+    },
+    "embedding.astChunking.enabled": {
+      "label": "AST Code Chunking",
+      "help": "Experimental: keep supported JavaScript, TypeScript, and Python functions/classes together when auto-chunking long code. Disabled by default.",
       "advanced": true
     },
     "embedding.clientTimeoutMs": {
@@ -1500,6 +1866,84 @@
       "label": "Database Path",
       "placeholder": "~/.openclaw/memory/lancedb-pro",
       "help": "Directory path for the LanceDB database files",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.enabled": {
+      "label": "Storage Auto-Cleanup",
+      "help": "Run scheduled LanceDB table maintenance to remove old version snapshots. Disabled by default.",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.intervalHours": {
+      "label": "Storage Cleanup Interval",
+      "placeholder": "24",
+      "help": "Hours between scheduled LanceDB table.optimize() cleanup runs.",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.retentionDays": {
+      "label": "Storage Retention Days",
+      "placeholder": "7",
+      "help": "Keep LanceDB table versions newer than this many days.",
+      "advanced": true
+    },
+    "storageMaintenance.autoCleanup.initialDelayMs": {
+      "label": "Storage Cleanup Initial Delay",
+      "placeholder": "300000",
+      "help": "Milliseconds to wait after startup before the first storage cleanup run.",
+      "advanced": true
+    },
+    "storageMaintenance.readConsistencyIntervalSeconds": {
+      "label": "Read Consistency Interval",
+      "placeholder": "0",
+      "help": "Seconds between checks for table updates from other processes (e.g. a CLI delete-bulk). 0 checks on every read; a running gateway may otherwise take up to this many seconds to notice deletes made elsewhere.",
+      "advanced": true
+    },
+    "redisUrl": {
+      "label": "Redis Lock URL",
+      "placeholder": "redis://localhost:6379",
+      "help": "Shortcut for enabling Redis distributed write locking. Prefer locking.redis.url for new configs.",
+      "sensitive": true,
+      "advanced": true
+    },
+    "locking.redis.enabled": {
+      "label": "Redis Write Lock",
+      "help": "Use Redis distributed locks for LanceDB writes. When enabled, Redis lock failures fail writes closed instead of falling back to local file locks.",
+      "advanced": true
+    },
+    "locking.redis.url": {
+      "label": "Redis Lock URL",
+      "placeholder": "redis://localhost:6379",
+      "help": "Redis connection URL for distributed write locking. Supports ${ENV_VAR} placeholders.",
+      "sensitive": true,
+      "advanced": true
+    },
+    "locking.redis.keyPrefix": {
+      "label": "Redis Lock Key Prefix",
+      "placeholder": "memory-lancedb-pro:write-lock",
+      "help": "Prefix used for Redis lock keys. Change this when sharing Redis across unrelated deployments.",
+      "advanced": true
+    },
+    "locking.redis.ttlMs": {
+      "label": "Redis Lock TTL",
+      "placeholder": "60000",
+      "help": "Redis write lock TTL in milliseconds.",
+      "advanced": true
+    },
+    "locking.redis.acquireTimeoutMs": {
+      "label": "Redis Lock Acquire Timeout",
+      "placeholder": "5000",
+      "help": "Maximum time to wait for Redis lock acquisition before failing the write so the caller can retry later.",
+      "advanced": true
+    },
+    "locking.redis.retryDelayMs": {
+      "label": "Redis Lock Retry Delay",
+      "placeholder": "50",
+      "help": "Initial Redis lock retry delay in milliseconds; retries use exponential backoff.",
+      "advanced": true
+    },
+    "locking.redis.connectTimeoutMs": {
+      "label": "Redis Lock Connect Timeout",
+      "placeholder": "1000",
+      "help": "Redis connection timeout in milliseconds before Redis-locked writes fail closed.",
       "advanced": true
     },
     "smartExtraction": {
@@ -1526,6 +1970,11 @@
     "extractMinMessages": {
       "label": "Min Messages for Extraction",
       "help": "Minimum conversation messages before smart extraction triggers",
+      "advanced": true
+    },
+    "autoCaptureContextTurns": {
+      "label": "Auto-Capture Context Turns",
+      "help": "Rolling window of recent user turns (with replies) kept as extraction context; 0 = off",
       "advanced": true
     },
     "extractMaxChars": {
@@ -1706,6 +2155,16 @@
       "help": "Number of candidates to fetch before fusion and reranking",
       "advanced": true
     },
+    "retrieval.neighborEnrichment.enabled": {
+      "label": "Neighbor Enrichment",
+      "help": "Attach bounded same-scope BM25 neighbors to hybrid retrieval results without changing the top-level count.",
+      "advanced": true
+    },
+    "retrieval.neighborEnrichment.maxPerResult": {
+      "label": "Neighbor Limit",
+      "help": "Maximum supplemental neighbors attached to each hybrid retrieval result.",
+      "advanced": true
+    },
     "retrieval.disableNativeCosine": {
       "label": "Disable Native Cosine",
       "help": "Use a scoped row scan plus JS cosine ranking instead of LanceDB native vector search. Enable on AVX-only Linux x64 CPUs that crash with SIGILL.",
@@ -1835,6 +2294,22 @@
       "help": "Optional dedicated agent id used for reflection generation (e.g. memory-distiller)",
       "advanced": true
     },
+    "memoryReflection.model": {
+      "label": "Reflection Model",
+      "placeholder": "anthropic/claude-sonnet-4-6",
+      "help": "Optional provider/model override for reflection generation. Falls back to the reflection agent's primary model, then llm.model.",
+      "advanced": true
+    },
+    "memoryReflection.maxConcurrentRuns": {
+      "label": "Reflection Max Concurrent Runs",
+      "help": "Max concurrent reflection runs across all agents (reflections queue in per-agent lanes). Default 1 keeps reflections serialized; raise to allow parallel reflections.",
+      "advanced": true
+    },
+    "memoryReflection.includeGroupChats": {
+      "label": "Reflect Group Chats",
+      "help": "Run the reflection distiller for group-chat sessions (:group:/:channel: session keys). Default true; set false to skip reflection generation on group channels.",
+      "advanced": true
+    },
     "memoryReflection.messageCount": {
       "label": "Reflection Message Count",
       "help": "Recent messages included in reflection input",
@@ -1884,6 +2359,9 @@
       "label": "Management Tools",
       "help": "Enable management/debug tools such as memory_list, memory_stats, and governance-oriented self-improvement review/extract actions.",
       "advanced": true
+    },
+    "manualStoreSupersede": {
+      "help": "Manual memory_store always lands; a similar existing memory is superseded by it instead of blocking the write (fact-key aware). Default off."
     },
     "mdMirror.enabled": {
       "label": "Markdown Mirror",
@@ -2020,6 +2498,9 @@
   "contracts": {
     "tools": [
       "memory_recall",
+      "memory_search",
+      "memory_get",
+      "memory_fact_query",
       "memory_store",
       "memory_update",
       "memory_forget",
@@ -2030,6 +2511,7 @@
       "memory_archive",
       "memory_promote",
       "memory_explain_rank",
+      "memory_reflection_resolve",
       "self_improvement_log",
       "self_improvement_extract_skill",
       "self_improvement_review"

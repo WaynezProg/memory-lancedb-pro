@@ -5,7 +5,8 @@
 import { computeEffectiveHalfLife, parseAccessMetadata, } from "./access-tracker.js";
 import { filterNoise } from "./noise-filter.js";
 import { expandQuery } from "./query-expander.js";
-import { getDecayableFromEntry, isMemoryVisibleInMode, parseSmartMetadata, toLifecycleMemory, } from "./smart-metadata.js";
+import { getDecayableFromEntry, isMemoryExpired, isMemoryVisibleInMode, parseSmartMetadata, toLifecycleMemory, } from "./smart-metadata.js";
+import { matchesMemoryCategoryFilter } from "./memory-categories.js";
 import { TraceCollector } from "./retrieval-trace.js";
 // ============================================================================
 // Default Configuration
@@ -30,7 +31,25 @@ export const DEFAULT_RETRIEVAL_CONFIG = {
     reinforcementFactor: 0.5,
     maxHalfLifeMultiplier: 3,
     tagPrefixes: ["proj", "env", "team", "scope"],
+    neighborEnrichment: {
+        enabled: false,
+        maxPerResult: 2,
+    },
 };
+export function normalizeRetrievalConfig(config) {
+    const neighborEnrichment = {
+        ...DEFAULT_RETRIEVAL_CONFIG.neighborEnrichment,
+        ...(config?.neighborEnrichment || {}),
+    };
+    return {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        ...config,
+        neighborEnrichment: {
+            enabled: Boolean(neighborEnrichment.enabled),
+            maxPerResult: clampInt(neighborEnrichment.maxPerResult, 1, 5),
+        },
+    };
+}
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -306,7 +325,6 @@ function cosineSimilarity(a, b) {
 export class MemoryRetriever {
     store;
     embedder;
-    config;
     decayEngine;
     accessTracker = null;
     lastDiagnostics = null;
@@ -315,9 +333,10 @@ export class MemoryRetriever {
     constructor(store, embedder, config = DEFAULT_RETRIEVAL_CONFIG, decayEngine = null) {
         this.store = store;
         this.embedder = embedder;
-        this.config = config;
         this.decayEngine = decayEngine;
+        this.config = normalizeRetrievalConfig(config);
     }
+    config;
     setAccessTracker(tracker) {
         this.accessTracker = tracker;
     }
@@ -337,9 +356,12 @@ export class MemoryRetriever {
         return this.store.hasFtsSupport;
     }
     async retrieve(context) {
-        const { query, limit, scopeFilter, category, source, lifecycleMode = "active" } = context;
+        const { query, limit, scopeFilter, category, source, lifecycleMode = "active", signal, rerankTimeoutMs, rerankDeadlineMs } = context;
         const safeLimit = clampInt(limit, 1, 20);
         this.lastDiagnostics = null;
+        // FLEET-PATCH(#884): resolve lazy store init BEFORE routing reads hasFtsSupport,
+        // otherwise the first retrieve() in a fresh process silently routes vector-only.
+        await this.store.ensureInitialized?.();
         const diagnostics = {
             source,
             mode: this.config.mode,
@@ -380,10 +402,10 @@ export class MemoryRetriever {
                 results = await this.bm25OnlyRetrieval(query, tagTokens, safeLimit, scopeFilter, category, trace, diagnostics, lifecycleMode);
             }
             else if (this.config.mode === "vector" || !hasFtsSupport) {
-                results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, diagnostics, lifecycleMode);
+                results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, trace, diagnostics, lifecycleMode, signal);
             }
             else {
-                results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace, source, diagnostics, lifecycleMode);
+                results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, trace, source, diagnostics, lifecycleMode, signal, rerankTimeoutMs, rerankDeadlineMs);
             }
             diagnostics.finalResultCount = results.length;
             diagnostics.dropSummary = buildDropSummary(diagnostics);
@@ -453,15 +475,17 @@ export class MemoryRetriever {
         const matches = query.match(regex);
         return matches || [];
     }
-    async vectorOnlyRetrieval(query, limit, scopeFilter, category, trace, diagnostics, lifecycleMode = "active") {
+    async vectorOnlyRetrieval(query, limit, scopeFilter, category, trace, diagnostics, lifecycleMode = "active", signal) {
         let failureStage = "vector.embedQuery";
         try {
             const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-            const queryVector = await this.embedder.embedQuery(query);
+            trace?.startStage("embed_query", [], "operation");
+            const queryVector = await this.embedder.embedQuery(query, signal);
+            trace?.endStage([]);
             failureStage = "vector.vectorSearch";
             const results = await this.store.vectorSearch(queryVector, candidatePoolSize, this.config.minScore, scopeFilter, { lifecycleMode });
             const filtered = category
-                ? results.filter((r) => r.entry.category === category)
+                ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
                 : results;
             // Filter expired memories early — before scoring — so they don't
             // occupy candidate slots that should go to live memories.
@@ -526,7 +550,7 @@ export class MemoryRetriever {
         trace?.startStage("bm25_search", []);
         const bm25Results = await this.store.bm25Search(query, candidatePoolSize, scopeFilter, { lifecycleMode });
         const categoryFiltered = category
-            ? bm25Results.filter((r) => r.entry.category === category)
+            ? bm25Results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
             : bm25Results;
         const mustContainFiltered = categoryFiltered.filter((r) => {
             const textLower = r.entry.text.toLowerCase();
@@ -600,11 +624,13 @@ export class MemoryRetriever {
             diagnostics.stageCounts.afterDiversity = deduplicated.length;
         return finalResults;
     }
-    async hybridRetrieval(query, limit, scopeFilter, category, trace, source, diagnostics, lifecycleMode = "active") {
+    async hybridRetrieval(query, limit, scopeFilter, category, trace, source, diagnostics, lifecycleMode = "active", signal, rerankTimeoutMs, rerankDeadlineMs) {
         let failureStage = "hybrid.embedQuery";
         try {
             const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-            const queryVector = await this.embedder.embedQuery(query);
+            trace?.startStage("embed_query", [], "operation");
+            const queryVector = await this.embedder.embedQuery(query, signal);
+            trace?.endStage([]);
             const bm25Query = this.buildBM25Query(query, source);
             if (diagnostics) {
                 diagnostics.bm25Query = bm25Query;
@@ -687,7 +713,7 @@ export class MemoryRetriever {
             failureStage = "hybrid.rerank";
             if (this.config.rerank !== "none") {
                 trace?.startStage("rerank", filtered.map((r) => r.entry.id));
-                reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics);
+                reranked = await this.rerankResults(query, queryVector, rerankInput, diagnostics, rerankTimeoutMs, rerankDeadlineMs);
                 trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
             }
             else {
@@ -747,7 +773,7 @@ export class MemoryRetriever {
             trace?.endStage(finalResults.map((r) => r.entry.id), finalResults.map((r) => r.score));
             if (diagnostics)
                 diagnostics.stageCounts.afterDiversity = deduplicated.length;
-            return finalResults;
+            return await this.enrichHybridNeighbors(finalResults, scopeFilter, category);
         }
         catch (error) {
             if (diagnostics) {
@@ -760,7 +786,7 @@ export class MemoryRetriever {
         const results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter, { lifecycleMode });
         // Filter by category if specified
         const filtered = category
-            ? results.filter((r) => r.entry.category === category)
+            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
             : results;
         return filtered.map((result, index) => ({
             ...result,
@@ -771,11 +797,61 @@ export class MemoryRetriever {
         const results = await this.store.bm25Search(query, limit, scopeFilter, { lifecycleMode });
         // Filter by category if specified
         const filtered = category
-            ? results.filter((r) => r.entry.category === category)
+            ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
             : results;
         return filtered.map((result, index) => ({
             ...result,
             rank: index + 1,
+        }));
+    }
+    async enrichHybridNeighbors(results, scopeFilter, category) {
+        const config = this.config.neighborEnrichment;
+        if (!config.enabled || results.length === 0)
+            return results;
+        const maxPerResult = clampInt(config.maxPerResult, 1, 5);
+        const primaryIds = new Set(results.map((result) => result.entry.id));
+        const neighborCandidateLimit = Math.min(primaryIds.size + maxPerResult + Math.max(10, maxPerResult * 4), 50);
+        return await Promise.all(results.map(async (result) => {
+            const resultScope = result.entry.scope || "global";
+            if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(resultScope)) {
+                return result;
+            }
+            let candidates;
+            try {
+                candidates = await this.store.bm25Search(result.entry.text, neighborCandidateLimit, [resultScope], { excludeInactive: true });
+            }
+            catch (error) {
+                console.warn(`[Retriever] neighbor enrichment BM25 lookup failed for ${result.entry.id}: ${formatErrorMessage(error)}`);
+                return result;
+            }
+            const neighbors = [];
+            for (const candidate of candidates) {
+                if (candidate.entry.id === result.entry.id)
+                    continue;
+                if (primaryIds.has(candidate.entry.id))
+                    continue;
+                if ((candidate.entry.scope || "global") !== resultScope)
+                    continue;
+                if (category && candidate.entry.category !== category)
+                    continue;
+                const metadata = parseSmartMetadata(candidate.entry.metadata, candidate.entry);
+                if (isMemoryExpired(metadata))
+                    continue;
+                if (this.config.filterNoise && filterNoise([candidate], (r) => r.entry.text).length === 0)
+                    continue;
+                neighbors.push({
+                    ...candidate,
+                    sources: {
+                        bm25: {
+                            score: candidate.score,
+                            rank: neighbors.length + 1,
+                        },
+                    },
+                });
+                if (neighbors.length >= maxPerResult)
+                    break;
+            }
+            return neighbors.length > 0 ? { ...result, neighbors } : result;
         }));
     }
     buildBM25Query(query, source) {
@@ -850,7 +926,7 @@ export class MemoryRetriever {
      * Rerank results using cross-encoder API (Jina, Pinecone, or compatible).
      * Falls back to cosine similarity if API is unavailable or fails.
      */
-    async rerankResults(query, queryVector, results, diagnostics) {
+    async rerankResults(query, queryVector, results, diagnostics, timeoutOverrideMs, deadlineMs) {
         if (results.length === 0) {
             return results;
         }
@@ -864,15 +940,30 @@ export class MemoryRetriever {
         };
         if (this.config.rerank === "cross-encoder" && hasApiKey) {
             try {
+                const remainingDeadlineMs = deadlineMs !== undefined
+                    ? Math.floor(deadlineMs - Date.now())
+                    : undefined;
+                if (timeoutOverrideMs !== undefined && timeoutOverrideMs <= 0) {
+                    recordFallback("timeout", "Rerank API skipped because caller timeout budget is exhausted");
+                    throw new Error("skip-remote-rerank-timeout-budget");
+                }
+                if (remainingDeadlineMs !== undefined && remainingDeadlineMs < 100) {
+                    recordFallback("timeout", "Rerank API skipped because caller timeout budget is exhausted");
+                    throw new Error("skip-remote-rerank-timeout-budget");
+                }
                 const model = this.config.rerankModel || "jina-reranker-v3";
                 const endpoint = this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
                 const documents = results.map((r) => r.entry.text);
                 const rerankTopN = Math.min(results.length, Math.max(1, this.config.candidatePoolSize));
                 // Build provider-specific request
                 const { headers, body } = buildRerankRequest(provider, this.config.rerankApiKey || "", model, query, documents, rerankTopN);
+                const configuredTimeoutMs = timeoutOverrideMs ?? this.config.rerankTimeoutMs ?? 5000;
+                const effectiveTimeoutMs = remainingDeadlineMs !== undefined
+                    ? Math.min(configuredTimeoutMs, remainingDeadlineMs)
+                    : configuredTimeoutMs;
                 // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
+                const timeout = setTimeout(() => controller.abort(), effectiveTimeoutMs);
                 let response;
                 try {
                     response = await fetch(endpoint, {
@@ -929,8 +1020,11 @@ export class MemoryRetriever {
                 }
             }
             catch (error) {
-                if (error instanceof Error && error.name === "AbortError") {
-                    const message = `Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms)`;
+                if (error instanceof Error && error.message === "skip-remote-rerank-timeout-budget") {
+                    // Caller supplied a zero/negative per-call timeout to reserve the outer budget.
+                }
+                else if (error instanceof Error && error.name === "AbortError") {
+                    const message = `Rerank API timed out (${timeoutOverrideMs ?? this.config.rerankTimeoutMs ?? 5000}ms)`;
                     recordFallback("timeout", message);
                     console.warn(`${message}, falling back to cosine`);
                 }
@@ -1026,7 +1120,11 @@ export class MemoryRetriever {
         this.decayEngine.applySearchBoost(scored);
         const reranked = results.map((result, index) => ({
             ...result,
-            score: clamp01(scored[index].score, result.score * 0.3),
+            // Corpus rows carry the source file's mtime as their timestamp;
+            // reference material must not decay like conversation memory.
+            score: (result.entry.id ?? "").startsWith("corpus:")
+                ? result.score
+                : clamp01(scored[index].score, result.score * 0.3),
         }));
         return reranked.sort((a, b) => b.score - a.score);
     }
@@ -1042,6 +1140,12 @@ export class MemoryRetriever {
         if (!anchor || anchor <= 0)
             return results;
         const normalized = results.map((r) => {
+            // Canonical corpus chunks are line-span document chunks: their length is
+            // a property of the chunker, not of entry quality. Normalising them by
+            // length double-penalises reference material (chunk size is already
+            // bounded by the indexer).
+            if ((r.entry.id ?? "").startsWith("corpus:"))
+                return r;
             const charLen = r.entry.text.length;
             const ratio = charLen / anchor;
             // No penalty for entries at or below anchor length.
@@ -1074,6 +1178,9 @@ export class MemoryRetriever {
             return results;
         const now = Date.now();
         const decayed = results.map((r) => {
+            // Reference chunks keep file mtimes — do not age them.
+            if ((r.entry.id ?? "").startsWith("corpus:"))
+                return r;
             const ts = r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
             const ageDays = (now - ts) / 86_400_000;
             // Access reinforcement: frequently recalled memories decay slower
@@ -1265,11 +1372,21 @@ export class MemoryRetriever {
     }
     // Update configuration
     updateConfig(newConfig) {
-        this.config = { ...this.config, ...newConfig };
+        this.config = normalizeRetrievalConfig({
+            ...this.config,
+            ...newConfig,
+            neighborEnrichment: {
+                ...this.config.neighborEnrichment,
+                ...(newConfig.neighborEnrichment || {}),
+            },
+        });
     }
     // Get current configuration
     getConfig() {
-        return { ...this.config };
+        return {
+            ...this.config,
+            neighborEnrichment: { ...this.config.neighborEnrichment },
+        };
     }
     getLastDiagnostics() {
         if (!this.lastDiagnostics)
@@ -1290,28 +1407,50 @@ export class MemoryRetriever {
     }
     // Test retrieval system
     async test(query = "test query") {
+        const resolveHealthFtsSupport = async () => {
+            try {
+                return { hasFtsSupport: await this.resolveFtsSupport() };
+            }
+            catch (error) {
+                return {
+                    hasFtsSupport: false,
+                    error: formatErrorMessage(error),
+                };
+            }
+        };
         try {
-            const results = await this.retrieve({
+            // The health probe validates vector/FTS wiring, not the rerank vendor.
+            // A zero rerank budget trips the existing skip guard, so the probe never
+            // pays a cold remote rerank roundtrip.
+            await this.retrieve({
                 query,
                 limit: 1,
+                rerankTimeoutMs: 0,
             });
+            const fts = await resolveHealthFtsSupport();
             return {
                 success: true,
                 mode: this.config.mode,
-                hasFtsSupport: await this.resolveFtsSupport(),
+                hasFtsSupport: fts.hasFtsSupport,
+                ...(fts.error ? { error: `FTS status check failed: ${fts.error}` } : {}),
             };
         }
         catch (error) {
+            const fts = await resolveHealthFtsSupport();
+            const retrievalError = formatErrorMessage(error);
             return {
                 success: false,
                 mode: this.config.mode,
-                hasFtsSupport: await this.resolveFtsSupport(),
-                error: error instanceof Error ? error.message : String(error),
+                hasFtsSupport: fts.hasFtsSupport,
+                failureStage: this.lastDiagnostics?.failureStage,
+                error: fts.error
+                    ? `${retrievalError}; FTS status check failed: ${fts.error}`
+                    : retrievalError,
             };
         }
     }
 }
 export function createRetriever(store, embedder, config, options) {
-    const fullConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
+    const fullConfig = normalizeRetrievalConfig(config);
     return new MemoryRetriever(store, embedder, fullConfig, options?.decayEngine ?? null);
 }

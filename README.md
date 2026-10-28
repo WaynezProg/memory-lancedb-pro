@@ -168,6 +168,21 @@ OpenClaw hosts receive:
 
 Dreaming compatibility is configured under the same plugin entry. If `dreaming.enabled` is true while this plugin owns `plugins.slots.memory`, OpenClaw can use the memory-core dreaming sidecar against this plugin's memory capability and public artifacts.
 
+On hosts exposing `openclaw/plugin-sdk/memory-recall`, interactive `memory_recall`
+(including the `memory_search`/`memory_get` aliases) and successful auto-recall
+injections also report surfaced canonical-file excerpts to native dreaming.
+This requires canonical-corpus metadata for the current workspace, matching
+content hashes, and the host's live tool/hook run context. The host validates the
+excerpt against the source file, applies its existing dreaming eligibility rules,
+and deduplicates repeated recalls within the same run. Only literal displayed
+primary text counts; generated abstracts, neighbor text, virtual LanceDB IDs,
+session transcripts, and late/failed injections do not become file evidence.
+Auto-context markup transformations are conservatively excluded. Daily corpus
+ingestion does not produce interactive signals. Older hosts without the API or
+invocation context continue normal retrieval without this additional recording.
+No native dreaming thresholds, promotion budgets, or provenance labels are
+changed by this bridge; it does not write native state directly.
+
 Validate & restart:
 
 ```bash
@@ -206,6 +221,62 @@ openclaw memory-pro stats
 
 See `CHANGELOG-v1.1.0.md` for behavior changes and upgrade rationale.
 
+**Turning on Jina task hints on an existing database?**
+
+Task hints are two config keys under the plugin's `embedding` block:
+
+```jsonc
+"memory-lancedb-pro": {
+  "config": {
+    "embedding": {
+      "model": "jina-embeddings-v5-text-small",
+      "taskQuery": "retrieval.query",
+      "taskPassage": "retrieval.passage"
+    }
+  }
+}
+```
+
+They only affect vectors written *after* you set them. Rows already in your store
+were embedded without a task hint, so a query embedded with `retrieval.query` is
+compared against passages that live in a different vector space — you get roughly
+half the benefit, silently.
+
+To fix existing rows, re-embed into a **fresh database and cut over to it**. Do
+**not** re-embed in place: `reembed` writes each row with `table.add()` (append by
+id, not replace), so an in-place run — which is exactly what `--force` unlocks —
+leaves the old vector beside the new one and **doubles every row**; retries pile on
+more. `reembed` refuses same-path runs unless you force it, for this reason.
+
+```bash
+# 0) Stop the gateway so nothing writes mid-migration.
+
+# 1) Back up the whole store — a real filesystem copy of the LanceDB directory.
+#    (Do NOT rely on `memory-pro export`: it defaults to --limit 1000 and a single
+#    --scope, so it silently drops rows past 1000 and every non-global scope.)
+cp -r <your dbPath> <your dbPath>.bak
+
+# 2) In the plugin config, set the task hints AND point `dbPath` at a new, empty
+#    target (e.g. "<your dbPath>-v2"). A fresh target is also what lets you change
+#    `embedding.dimensions`: a new vector width can only go into a new table.
+
+# 3) Dry run — reads the source, prints the row count, writes nothing.
+openclaw memory-pro reembed --source-db <old dbPath> --dry-run
+
+# 4) Re-embed old -> new with the now-current task hints. Source != target, so each
+#    id lands exactly once. Safe to re-run with --skip-existing if interrupted.
+openclaw memory-pro reembed --source-db <old dbPath>
+
+# 5) Verify before trusting the cutover: the "imported" count and
+#    `memory-pro stats` on the new dbPath must equal the dry-run row count.
+openclaw memory-pro stats
+
+# 6) Start the gateway; it now opens the new dbPath.
+```
+
+The same cutover applies whenever you change `embedding.model` or
+`embedding.dimensions` — always re-embed into a fresh `dbPath`, never in place.
+
 </details>
 
 <details>
@@ -220,7 +291,7 @@ Help me connect this memory plugin with the most user-friendly configuration: ht
 
 Requirements:
 1. Set it as the only active memory plugin
-2. Use Jina for embedding
+2. Use Jina for embedding, and set embedding.taskQuery=retrieval.query and embedding.taskPassage=retrieval.passage
 3. Use Jina for reranker
 4. Use gpt-4o-mini for the smart-extraction LLM
 5. Enable autoCapture, autoRecall, smartExtraction
@@ -402,6 +473,7 @@ Query → BM25 FTS ─────┘
 - Built-in scopes: `global`, `agent:<id>`, `custom:<name>`, `project:<id>`, `user:<id>`
 - Agent-level access control via `scopes.agentAccess`
 - Default: each agent accesses `global` + its own `agent:<id>` scope
+- Read-only tools such as `memory_recall`, `memory_search`, `memory_list`, and `memory_debug` fail soft when a requested scope is inaccessible: they search the caller's accessible scopes instead and return `ignoredScope` plus `accessibleScopes` in details. Write and mutation tools still return `scope_access_denied` for inaccessible scopes.
 
 ### Auto-Capture & Auto-Recall
 
@@ -447,6 +519,21 @@ Query → BM25 FTS ─────┘
 
 ## Configuration
 
+API-key fields (`embedding.apiKey`, `retrieval.rerankApiKey`, and `llm.apiKey`) accept plain strings, `${ENV_VAR}` placeholders, or SecretRef objects. This plugin supports the `env` and `file` SecretRef sources:
+
+```json
+{
+  "embedding": {
+    "apiKey": { "source": "env", "id": "JINA_API_KEY" }
+  },
+  "retrieval": {
+    "rerankApiKey": { "source": "file", "id": "~/.openclaw/secrets/jina-rerank" }
+  }
+}
+```
+
+For `source: "file"`, `id` is resolved through OpenClaw's `api.resolvePath()` and then read as a UTF-8 file. The optional `provider` field is accepted for SecretRef object-shape compatibility but is not used for provider dispatch. `exec` and other SecretRef sources are rejected by runtime config validation.
+
 <details>
 <summary><strong>Full Configuration Example</strong></summary>
 
@@ -460,6 +547,7 @@ Query → BM25 FTS ─────┘
     "taskQuery": "retrieval.query",
     "taskPassage": "retrieval.passage",
     "normalized": true,
+    "maxInputChars": 1400,
     "clientTimeoutMs": 30000
   },
   "dbPath": "~/.openclaw/memory/lancedb-pro",
@@ -515,10 +603,30 @@ Query → BM25 FTS ─────┘
 
 </details>
 
+### OpenClaw Hook Permissions
+
+The published plugin manifest declares `hooks.allowConversationAccess` so the `agent_end` auto-capture hook can read conversation context. If you maintain a custom plugin entry or non-bundled install that overrides manifest hook metadata, keep conversation access enabled:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
+```
+
+Without conversation access, recall can still load but auto-capture may be blocked.
+
 <details>
 <summary><strong>Embedding Providers</strong></summary>
 
-Works with **any OpenAI-compatible embedding API**:
+Works with **OpenAI-compatible embedding APIs**, including provider-specific payload adapters for services such as Jina and Voyage:
 
 | Provider | Model | Base URL | Dimensions |
 | --- | --- | --- | --- |
@@ -527,6 +635,10 @@ Works with **any OpenAI-compatible embedding API**:
 | **Voyage** | `voyage-4-lite` / `voyage-4` | `https://api.voyageai.com/v1` | 1024 / 1024 |
 | **Google Gemini** | `gemini-embedding-001` | `https://generativelanguage.googleapis.com/v1beta/openai/` | 3072 |
 | **Ollama** (local) | `nomic-embed-text` | `http://localhost:11434/v1` | provider-specific |
+
+Voyage embedding requests use Voyage's `model` + `input` payload shape. When `requestDimensions` is configured it is sent as `output_dimension`; OpenAI-only fields such as `encoding_format` are omitted.
+
+Set `embedding.maxInputChars` for local embedding servers with small context or batch limits. The plugin applies a conservative default for `nomic-embed-text`; with automatic chunking enabled, longer documents are split before the cap is applied to each provider request.
 
 </details>
 
@@ -665,6 +777,22 @@ OAuth login flow:
 ## Advanced Topics
 
 <details>
+<summary><strong>Locking and concurrent writers</strong></summary>
+
+`memory-lancedb-pro` uses a cross-process file lock for LanceDB writes. This is
+enough for one gateway process, multiple agents through that gateway, and local
+processes that share the same database directory.
+
+Redis is not required for those deployments. Redis locking is enabled when
+`locking.redis.enabled` is true, when `redisUrl`/`locking.redis.url` is set, or
+when `MEMORY_LANCEDB_REDIS_URL` is present in that process environment. For
+multi-machine or multi-container writers, read
+[Lock Management](docs/lock-management.md) before sharing a LanceDB directory
+across processes, and make sure every writer uses the same lock configuration.
+
+</details>
+
+<details>
 <summary><strong>If injected memories show up in replies</strong></summary>
 
 Sometimes the model may echo the injected `<relevant-memories>` block.
@@ -706,6 +834,17 @@ Auto-recall has a configurable timeout (default 5s) to prevent stalling agent st
 ```
 
 If auto-recall consistently times out, check your embedding API latency first. The timeout only affects the automatic injection path — manual `memory_recall` tool calls are not affected.
+
+</details>
+
+<details>
+<summary><strong>Auto-recall rerank cost model</strong></summary>
+
+When `autoRecall=true` and hybrid retrieval uses `retrieval.rerank="cross-encoder"` with an external rerank API such as Jina, every eligible prompt can make a rerank request. The number of documents sent to that request is governed by auto-recall's retrieve limit and the retriever's rerank input window, not directly by `retrieval.candidatePoolSize` or by the final `autoRecallMaxItems` injection cap.
+
+For example, with `autoRecallMaxItems: 3`, auto-recall asks retrieval for 6 items and hybrid retrieval may send up to 12 candidates to the external reranker before injecting at most 3 memories. To reduce external rerank usage, lower `autoRecallMaxItems` or `maxRecallPerTurn`, switch `retrieval.rerank` to `"lightweight"` or `"none"`, increase `autoRecallMinLength`, or keep auto-recall disabled and use manual `memory_recall` where appropriate.
+
+Startup logs warn when auto-recall plus hybrid cross-encoder rerank can send more items to the reranker than it will inject. Debug auto-recall stats include the actual `rerankInput`, `rerankInputLimit`, `retrieveLimit`, `rerank`, `rerankProvider`, and configured `retrievalCandidatePoolSize`.
 
 </details>
 
@@ -883,6 +1022,7 @@ openclaw doctor --fix # resolve any stale config after upgrade
 | [OpenClaw Integration Playbook](docs/openclaw-integration-playbook.md) | Deployment modes, verification, regression matrix |
 | [Memory Architecture Analysis](docs/memory_architecture_analysis.md) | Full architecture deep-dive |
 | [CHANGELOG v1.1.0](docs/CHANGELOG-v1.1.0.md) | v1.1.0 behavior changes and upgrade rationale |
+| [Release Checklist](docs/release-checklist.md) | Package preflight, publish dry run, and post-publish smoke checks |
 | [Long-Context Chunking](docs/long-context-chunking.md) | Chunking strategy for long documents |
 
 ---
@@ -929,11 +1069,11 @@ Full list: [Contributors](https://github.com/CortexReach/memory-lancedb-pro/grap
 
 ## Star History
 
-<a href="https://star-history.com/#CortexReach/memory-lancedb-pro&Date">
+<a href="https://star-history.dera.page/#CortexReach/memory-lancedb-pro&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=CortexReach/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=CortexReach/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=CortexReach/memory-lancedb-pro&type=Date&transparent=true" />
   </picture>
 </a>
 

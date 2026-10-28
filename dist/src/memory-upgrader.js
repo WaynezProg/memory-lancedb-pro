@@ -6,13 +6,43 @@
  * to enable unified memory lifecycle management (decay, tier promotion,
  * smart dedup).
  *
- * Pipeline per memory:
+ * Pipeline per batch:
  *   1. Detect legacy format (missing `memory_category` in metadata)
- *   2. Reverse-map 5-category → 6-category
- *   3. Generate L0/L1/L2 via LLM (or fallback to simple rules)
- *   4. Write enriched metadata back via store.update()
+ *   2. Reverse-map 5-category → 6-category and generate L0/L1/L2
+ *   3. Prepare update patches without holding the DB write lock
+ *   4. Write prepared patches in a batch where the store supports it
  */
 import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
+import { getReflectionMappedMemoryCategory, getReflectionMappedStorageCategory, } from "./reflection-mapped-metadata.js";
+function isReflectionMappedKind(value) {
+    return (value === "user-model" ||
+        value === "agent-model" ||
+        value === "lesson" ||
+        value === "decision");
+}
+const CURRENT_REFLECTION_METADATA_TYPES = new Set([
+    "memory-reflection",
+    "memory-reflection-event",
+    "memory-reflection-item",
+    "memory-reflection-mapped",
+]);
+function parseMetadata(metadata) {
+    if (!metadata)
+        return null;
+    try {
+        const parsed = JSON.parse(metadata);
+        return parsed && typeof parsed === "object" ? parsed : null;
+    }
+    catch {
+        return null;
+    }
+}
+export function isCurrentReflectionMemory(entry) {
+    if (entry.category === "reflection")
+        return true;
+    const meta = parseMetadata(entry.metadata);
+    return typeof meta?.type === "string" && CURRENT_REFLECTION_METADATA_TYPES.has(meta.type);
+}
 // ============================================================================
 // Reverse Category Mapping
 // ============================================================================
@@ -105,24 +135,28 @@ export class MemoryUpgrader {
     /**
      * Check if a memory entry is in legacy format (needs upgrade).
      * Legacy = no metadata, or metadata lacks `memory_category`.
+     * Reflection rows are first-class current-format memories with their own
+     * metadata schema and read path, so they intentionally do not carry
+     * SmartExtractor `memory_category`.
      */
     isLegacyMemory(entry) {
+        if (isCurrentReflectionMemory(entry))
+            return false;
         if (!entry.metadata)
             return true;
-        try {
-            const meta = JSON.parse(entry.metadata);
-            // If it has memory_category, it was created by SmartExtractor → new format
-            return !meta.memory_category;
-        }
-        catch {
+        const meta = parseMetadata(entry.metadata);
+        if (!meta)
             return true;
-        }
+        // If it has memory_category, it was created by SmartExtractor → new format
+        return !meta.memory_category;
     }
     /**
      * Scan and count legacy memories without modifying them.
      */
     async countLegacy(scopeFilter) {
-        const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0);
+        // excludeInactive:false -- the upgrader must see EVERY row (invalidated
+        // ones included): historical rows are still read through the new schema.
+        const allMemories = await this.store.list(scopeFilter, undefined, 10000, 0, { excludeInactive: false });
         let legacy = 0;
         const byCategory = {};
         for (const entry of allMemories) {
@@ -132,6 +166,110 @@ export class MemoryUpgrader {
             }
         }
         return { total: allMemories.length, legacy, byCategory };
+    }
+    /**
+     * One-shot, opt-in pass that re-stamps `memory_category` on existing
+     * reflection-mapped rows using the same write-time mapping new rows get
+     * (see `getReflectionMappedMemoryCategory`). Reflection-mapped rows are
+     * intentionally excluded from `isLegacyMemory`/`upgrade()` — this is a
+     * separate, narrower pass that touches only that one field on rows whose
+     * `type` is `memory-reflection-mapped`, and only when the stamped value is
+     * missing or wrong. Safe to run repeatedly: a row already carrying the
+     * correct value is left untouched, so a second run is a no-op.
+     */
+    async normalizeMappedRowCategories(options = {}) {
+        const dryRun = options.dryRun ?? false;
+        const scopeFilter = options.scopeFilter;
+        const pageSize = Math.max(1, options.pageSize ?? 1000);
+        const result = {
+            totalMapped: 0,
+            normalized: 0,
+            alreadyCorrect: 0,
+            errors: [],
+        };
+        // Phase 1 — paged scan. Pages the whole store (list sorts newest-first;
+        // no single-page cap), keeping only ids plus the scan-time snapshot as a
+        // fallback payload. A row is "already correct" only when BOTH faces hold:
+        // the stamped metadata value and the legacy-vocabulary storage column.
+        const targets = [];
+        for (let offset = 0;; offset += pageSize) {
+            const page = await this.store.list(scopeFilter, undefined, pageSize, offset, { excludeInactive: false });
+            for (const entry of page) {
+                const meta = parseMetadata(entry.metadata);
+                if (!meta || meta.type !== "memory-reflection-mapped")
+                    continue;
+                if (!isReflectionMappedKind(meta.mappedKind))
+                    continue;
+                result.totalMapped++;
+                const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
+                const expectedStorage = getReflectionMappedStorageCategory(meta.mappedKind);
+                if (meta.memory_category === expected && entry.category === expectedStorage) {
+                    result.alreadyCorrect++;
+                    continue;
+                }
+                targets.push({ entry, meta });
+            }
+            if (page.length < pageSize)
+                break;
+        }
+        if (dryRun || targets.length === 0) {
+            result.normalized = targets.length;
+            return result;
+        }
+        // Phase 2 — chunked fresh-read + write. The store's update paths replace
+        // metadata all-or-nothing, so a patch built from the scan snapshot would
+        // silently roll back any concurrent metadata write (access counters,
+        // admission audits, tier changes) that landed after the scan. Re-reading
+        // each row immediately before building its patch shrinks that window from
+        // scan-to-write to per-chunk milliseconds; stores without getById fall
+        // back to the scan snapshot (test doubles, minimal adapters).
+        const storeWithGetById = this.store;
+        const canRefetch = typeof storeWithGetById.getById === "function";
+        const chunkSize = 100;
+        for (let start = 0; start < targets.length; start += chunkSize) {
+            const chunk = targets.slice(start, start + chunkSize);
+            const prepared = [];
+            for (const target of chunk) {
+                let entry = target.entry;
+                let meta = target.meta;
+                if (canRefetch) {
+                    try {
+                        const fresh = await storeWithGetById.getById(target.entry.id, scopeFilter);
+                        if (!fresh)
+                            continue; // deleted since the scan — nothing to normalize
+                        const freshMeta = parseMetadata(fresh.metadata);
+                        if (!freshMeta || freshMeta.type !== "memory-reflection-mapped")
+                            continue;
+                        if (!isReflectionMappedKind(freshMeta.mappedKind))
+                            continue;
+                        entry = fresh;
+                        meta = freshMeta;
+                    }
+                    catch (err) {
+                        result.errors.push(`re-read failed for ${target.entry.id}: ${err instanceof Error ? err.message : String(err)}`);
+                        continue;
+                    }
+                }
+                const expected = getReflectionMappedMemoryCategory(meta.mappedKind);
+                const expectedStorage = getReflectionMappedStorageCategory(meta.mappedKind);
+                if (meta.memory_category === expected && entry.category === expectedStorage) {
+                    result.alreadyCorrect++;
+                    continue;
+                }
+                const updates = {
+                    metadata: JSON.stringify({ ...meta, memory_category: expected }),
+                };
+                if (entry.category !== expectedStorage) {
+                    updates.category = expectedStorage;
+                }
+                prepared.push({ entry, updates });
+            }
+            const writeResult = { upgraded: 0, errors: [] };
+            await this.writePreparedBatch(prepared, writeResult, scopeFilter);
+            result.normalized += writeResult.upgraded;
+            result.errors.push(...writeResult.errors);
+        }
+        return result;
     }
     /**
      * Main upgrade entry point.
@@ -150,7 +288,7 @@ export class MemoryUpgrader {
         };
         // Load all memories
         this.log("memory-upgrader: scanning memories...");
-        const allMemories = await this.store.list(options.scopeFilter ?? this.options.scopeFilter, undefined, 10000, 0);
+        const allMemories = await this.store.list(options.scopeFilter ?? this.options.scopeFilter, undefined, 10000, 0, { excludeInactive: false });
         // Filter legacy memories
         const legacyMemories = allMemories.filter((m) => this.isLegacyMemory(m));
         result.totalLegacy = legacyMemories.length;
@@ -176,17 +314,18 @@ export class MemoryUpgrader {
         for (let i = 0; i < toProcess.length; i += batchSize) {
             const batch = toProcess.slice(i, i + batchSize);
             this.log(`memory-upgrader: processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(toProcess.length / batchSize)} (${batch.length} memories)`);
+            const prepared = [];
             for (const entry of batch) {
                 try {
-                    await this.upgradeEntry(entry, noLlm);
-                    result.upgraded++;
+                    prepared.push(await this.prepareUpgradeEntry(entry, noLlm));
                 }
                 catch (err) {
-                    const errMsg = `Failed to upgrade ${entry.id}: ${String(err)}`;
+                    const errMsg = `Failed to prepare upgrade ${entry.id}: ${String(err)}`;
                     result.errors.push(errMsg);
                     this.log(`memory-upgrader: ERROR — ${errMsg}`);
                 }
             }
+            await this.writePreparedBatch(prepared, result, options.scopeFilter ?? this.options.scopeFilter);
             // Progress report
             this.log(`memory-upgrader: progress — ${result.upgraded} upgraded, ${result.errors.length} errors`);
         }
@@ -194,9 +333,9 @@ export class MemoryUpgrader {
         return result;
     }
     /**
-     * Upgrade a single legacy memory entry.
+     * Prepare a single legacy memory entry without writing to the store.
      */
-    async upgradeEntry(entry, noLlm) {
+    async prepareUpgradeEntry(entry, noLlm) {
         // Step 1: Reverse-map category
         let newCategory = reverseMapCategory(entry.category, entry.text);
         // Step 2: Generate L0/L1/L2
@@ -232,6 +371,11 @@ export class MemoryUpgrader {
         else {
             enriched = simpleEnrich(entry.text, newCategory);
         }
+        const fullSearchableText = enriched.l2_content.trim() || entry.text;
+        enriched = {
+            ...enriched,
+            l2_content: fullSearchableText,
+        };
         // Step 3: Build enriched metadata
         const existingMeta = entry.metadata ? (() => {
             try {
@@ -254,12 +398,66 @@ export class MemoryUpgrader {
             upgraded_from: entry.category,
             upgraded_at: Date.now(),
         };
-        // Step 4: Update the memory entry
-        await this.store.update(entry.id, {
-            // Update text to L0 abstract for better search indexing
-            text: enriched.l0_abstract,
-            metadata: stringifySmartMetadata(newMetadata),
-        });
+        return {
+            entry,
+            updates: {
+                // Keep the full searchable layer in the primary text column. Search also
+                // scores L0/L1/L2 metadata, so replacing text with L0 would discard recall
+                // terms that only appear in the original content.
+                text: fullSearchableText,
+                metadata: stringifySmartMetadata(newMetadata),
+            },
+        };
+    }
+    /**
+     * Persist a prepared batch with one store-level batch call when available.
+     * Takes the narrow slice of the result shape it actually mutates so both
+     * `UpgradeResult` and `CategoryNormalizationResult` can reuse it.
+     */
+    async writePreparedBatch(prepared, result, scopeFilter) {
+        if (prepared.length === 0)
+            return;
+        const store = this.store;
+        if (typeof store.bulkUpdateExact === "function") {
+            let writeResults;
+            try {
+                writeResults = await store.bulkUpdateExact(prepared.map(({ entry, updates }) => ({ id: entry.id, updates })), scopeFilter);
+            }
+            catch (err) {
+                for (const { entry } of prepared) {
+                    const errMsg = `Failed to write upgrade ${entry.id}: ${String(err)}`;
+                    result.errors.push(errMsg);
+                    this.log(`memory-upgrader: ERROR — ${errMsg}`);
+                }
+                return;
+            }
+            for (let index = 0; index < writeResults.length; index++) {
+                const writeResult = writeResults[index];
+                const fallbackEntry = prepared[index]?.entry;
+                if (writeResult.entry) {
+                    result.upgraded++;
+                }
+                else {
+                    const id = writeResult.id ?? fallbackEntry?.id ?? "unknown";
+                    const detail = writeResult.error ? `: ${writeResult.error}` : "";
+                    const errMsg = `Failed to write upgrade ${id}${detail}`;
+                    result.errors.push(errMsg);
+                    this.log(`memory-upgrader: ERROR — ${errMsg}`);
+                }
+            }
+            return;
+        }
+        for (const { entry, updates } of prepared) {
+            try {
+                await this.store.update(entry.id, updates, scopeFilter);
+                result.upgraded++;
+            }
+            catch (err) {
+                const errMsg = `Failed to write upgrade ${entry.id}: ${String(err)}`;
+                result.errors.push(errMsg);
+                this.log(`memory-upgrader: ERROR — ${errMsg}`);
+            }
+        }
     }
 }
 // ============================================================================

@@ -3,12 +3,14 @@ type RetryClassifierInput = {
   retryCount: number;
   usefulOutputChars: number;
   error: unknown;
+  callerAborted?: boolean;
 };
 
 type RetryClassifierResult = {
   retryable: boolean;
   reason:
   | "not_reflection_scope"
+  | "caller_aborted"
   | "retry_already_used"
   | "useful_output_present"
   | "non_retry_error"
@@ -21,12 +23,16 @@ type RetryState = { count: number };
 
 type RetryRunnerParams<T> = {
   scope: "reflection" | "distiller";
-  runner: "embedded" | "cli";
+  runner: string;
   retryState: RetryState;
   execute: () => Promise<T>;
   onLog?: (level: "info" | "warn", message: string) => void;
   random?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  // Caller-side cancellation (an AbortSignal works structurally). An abort the
+  // CALLER requested must never be retried, even when the surfaced error text
+  // matches the transient request-abort patterns below.
+  signal?: { aborted: boolean };
 };
 
 const REFLECTION_TRANSIENT_PATTERNS: RegExp[] = [
@@ -39,6 +45,7 @@ const REFLECTION_TRANSIENT_PATTERNS: RegExp[] = [
   /socket hang up/i,
   /socket (?:closed|disconnected)/i,
   /connection (?:closed|aborted|dropped)/i,
+  /\bconnection error\b/i,
   /early close/i,
   /stream (?:ended|closed) unexpectedly/i,
   /temporar(?:y|ily).*unavailable/i,
@@ -49,6 +56,8 @@ const REFLECTION_TRANSIENT_PATTERNS: RegExp[] = [
   /\b(?:http|status)\s*(?:502|503|504)\b/i,
   /\btimed out\b/i,
   /\btimeout\b/i,
+  /request was aborted/i,
+  /\baborterror\b/i,
   /\bund_err_(?:socket|headers_timeout|body_timeout)\b/i,
   /network error/i,
   /fetch failed/i,
@@ -64,6 +73,7 @@ const REFLECTION_NON_RETRY_PATTERNS: RegExp[] = [
   /\bbilling\b/i,
   /\bquota exceeded\b/i,
   /payment required/i,
+  /async work scope is closed/i,
   /model .*not found/i,
   /no such model/i,
   /unknown model/i,
@@ -120,6 +130,9 @@ export function classifyReflectionRetry(input: RetryClassifierInput): RetryClass
   if (!input.inReflectionScope) {
     return { retryable: false, reason: "not_reflection_scope", normalizedError };
   }
+  if (input.callerAborted) {
+    return { retryable: false, reason: "caller_aborted", normalizedError };
+  }
   if (input.retryCount > 0) {
     return { retryable: false, reason: "retry_already_used", normalizedError };
   }
@@ -152,6 +165,7 @@ export async function runWithReflectionTransientRetryOnce<T>(
       retryCount: params.retryState.count,
       usefulOutputChars: 0,
       error,
+      callerAborted: params.signal?.aborted === true,
     });
     if (!decision.retryable) throw error;
 
@@ -163,6 +177,13 @@ export async function runWithReflectionTransientRetryOnce<T>(
       `retrying once in ${delayMs}ms (${decision.reason}). error=${decision.normalizedError}`
     );
     await (params.sleep ?? DEFAULT_SLEEP)(delayMs);
+    if (params.signal?.aborted) {
+      params.onLog?.(
+        "warn",
+        `memory-${params.scope}: caller aborted during retry backoff (${params.runner}); not retrying`
+      );
+      throw error;
+    }
 
     try {
       const result = await params.execute();
@@ -177,4 +198,33 @@ export async function runWithReflectionTransientRetryOnce<T>(
       throw retryError;
     }
   }
+}
+
+/**
+ * Retry-once wrapper for reflection-lane EMBEDDING calls (persistence path).
+ * The generation path already runs under runWithReflectionTransientRetryOnce;
+ * without this, one transient embedding abort while persisting mapped rows or
+ * slices failed the whole hook after the reflection md was already written,
+ * losing the cycle's rows. Each embed call carries its own single-retry
+ * budget, so one healed abort does not spend the budget of later rows.
+ * A caller-provided abort signal suppresses the retry entirely: cancellation
+ * the caller requested is not a transient failure, whatever the error text.
+ */
+export async function embedWithReflectionTransientRetry(
+  embed: (text: string) => Promise<number[]>,
+  text: string,
+  runner: string,
+  onLog?: (level: "info" | "warn", message: string) => void,
+  sleep?: (ms: number) => Promise<void>,
+  signal?: { aborted: boolean },
+): Promise<number[]> {
+  return runWithReflectionTransientRetryOnce({
+    scope: "reflection",
+    runner,
+    retryState: { count: 0 },
+    onLog,
+    sleep,
+    signal,
+    execute: () => embed(text),
+  });
 }
