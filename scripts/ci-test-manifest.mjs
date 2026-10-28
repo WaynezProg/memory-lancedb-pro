@@ -19,6 +19,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/smart-extractor-scope-filter.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-empty-scope-filter.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-write-queue.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/local-write-lock-queue.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/manual-recall-metadata-queue.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-timestamp-normalization.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/storage-path-normalization.test.mjs", args: ["--test"] },

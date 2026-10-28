@@ -57,7 +57,7 @@ test("local write lock queue serializes real mixed writes and both optimize path
       assert.ok(active >= 0 && active <= 1, `overlapping mutation: ${events.join(", ")}`);
     }
     assert.equal(active, 0);
-  } finally { gate.resolve(); await store.close?.(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { gate.resolve(); await store.destroy(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("local write lock queue preserves call order and rollback after competing updates", { timeout: 30000 }, async () => {
@@ -89,6 +89,6 @@ test("local write lock queue preserves call order and rollback after competing u
       gate.resolve();
       await assert.rejects(second, /latest available record restored/);
       assert.equal((await store.getById(row.id)).text, "first");
-    } finally { gate.resolve(); await store.close?.(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { gate.resolve(); await store.destroy(); rmSync(dir, { recursive: true, force: true }); }
   }
 });
